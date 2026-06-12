@@ -1,28 +1,69 @@
-# Short-Job Penalty Service Implementation Plan
+# Short-Job Penalty Service Implementation Plan (Revision 2)
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Extract short-job-penalty accounting into a dedicated in-memory service driven by job-lifecycle events, so the scheduler stops scanning every job in jobdb each cycle to recompute the penalty and jobdb can immediately GC terminal short jobs.
 
-**Architecture:** A new `ShortJobPenaltyService` owns penalty state keyed by `(pool, queue) -> ResourceList`. Terminal short jobs are reported into it once, leader-only, from the per-cycle reconcile loop in `cycle()` (riding alongside the existing `ReportStateTransitions` loop, iterating `jsts` not `updatedJobs`). State self-expires lazily via a deadline min-heap evaluated against a pinned cycle-start `now` that is threaded as an explicit parameter into both the write path (`ReportFinishedJob`) and the read path (`Schedule` -> `calculateJobSchedulingInfo` -> `GetPenaltiesForPool`). The old per-job `ShouldApplyPenalty` predicate is reused verbatim as the service's internal qualification gate (it is load-bearing for both today-parity and post-expiry dedup). jobdb GC becomes unconditional, and the `fullJobGc` special case plus the `GetAllTerminalJobs` fetch in the scheduling round are removed.
+**Architecture:** A new `ShortJobPenaltyService` owns penalty state keyed by `(pool, queue) -> ResourceList`. Terminal short jobs are reported into it once, **on every node (leader and followers)**, from inside `syncState` immediately after `ReconcileDifferences` derives the cycle's `jsts` and **before** the (now unconditional) terminal-job GC in the same function. The candidate check at the call site is `jst.Job.InTerminalState()` — the job-level terminal state — NOT the run-level `jst.Succeeded/Failed/Cancelled` transition flags (see "Lifecycle timing facts" below for why the flags are wrong). State self-expires lazily via a deadline min-heap evaluated against a pinned cycle-start `now` that is threaded as an explicit parameter into the write path (`cycle` -> `syncState` -> `ReportFinishedJob`) and the read path (`Schedule` -> `calculateJobSchedulingInfo` -> `GetPenaltiesForPool`). The old per-job `ShouldApplyPenalty` predicate is reused verbatim as the service's internal qualification gate (it is load-bearing for both today-parity and post-expiry dedup). jobdb GC becomes unconditional, the `fullJobGc` special case and the `GetAllTerminalJobs` fetch in the scheduling round are removed, and the now-dead `terminalJobs` jobdb index is deleted.
 
-**Tech Stack:** Go, `container/heap` (stdlib), `k8s.io/utils/clock`, existing `internaltypes.ResourceList` value type, testify.
+**Tech Stack:** Go, `container/heap` (stdlib), existing `internaltypes.ResourceList` value type, testify.
 
 ---
 
-## Design decisions locked in (from brainstorming Q&A)
+## Revision 2 changelog (review findings — read before executing)
 
-These were resolved with the requesting engineer and must not be re-litigated during execution:
+Revision 1 was reviewed against the codebase at `9c8126f`. The following defects were found and are corrected throughout this revision:
 
-- **No `ReportDeletedJob`.** Finish/terminal event + lazy time-based expiry fully reproduces today's behavior. Deletion events are not added (they reintroduce double-count/ordering hazards for no benefit).
-- **Terminal tap set = `Succeeded || Failed || Cancelled`** (exactly `Job.InTerminalState()`). Cancel-while-running short jobs ARE penalized today; excluding cancelled would be a regression.
-- **The JST flags are only a cheap pre-filter.** The real gate is `ShouldApplyPenalty(job, now)`, reused verbatim. It does double duty: today-parity filter AND post-expiry dedup (expiry deadline `runStart + cutoff` is algebraically identical to the qualification cutoff `now - runStart < cutoff`, so an expired entry can never re-qualify -> no tombstone needed).
-- **One pinned cycle-start `now`,** threaded as an explicit parameter into both `ReportFinishedJob` and `GetPenaltiesForPool`. No `SetNow` setter. No `time.Now()` at call sites.
-- **Feed runs every cycle but leader-only.** Tap `jsts` (genuinely-transitioned jobs), NOT `updatedJobs` (which becomes `txn.GetAll()` on the `updateAll` failover path - iterating it would re-charge every job). Place the feed inside the leader block of `cycle()` after `ValidateToken`, beside the existing `ReportStateTransitions` loop.
-- **GC becomes unconditional in `syncState`.** It no longer consults the penalty. Followers GC their own jobdb mirror too (desirable - smaller jobdb everywhere). The `fullJobGc` parameter and the `cycleNumber%10==0` full-sweep exist solely to eventually collect short jobs the per-cycle GC skipped; both are removed.
-- **Cold-restart / failover gaps are acceptable.** Penalties may be empty for up to one cutoff window after a full restart or leader failover. No restart-rebuild DB query. This is no worse than today (`SelectInitialJobs` already filters `terminated = false`).
+1. **FATAL (fixed): the v1 feed never charged succeeded or failed jobs.** v1 fed the service leader-only from the `cycle()` leader block, pre-filtered on `jst.Succeeded || jst.Failed || jst.Cancelled`. Those are **run-level** transition flags; the qualification gate requires **job-level** `Job.InTerminalState()`. For the success and failure paths these are never true in the same cycle's jst (see "Lifecycle timing facts"), so the penalty would silently never apply to the two most common terminal states. **Fix:** feed from `syncState` using `jst.Job.InTerminalState()` as the candidate check; never consult the jst flags.
+2. **Feed moved from leader-only to all nodes** (inside `syncState`, which every node runs). This (a) closes the leader-failover gap v1 had accepted — today followers retain terminal short jobs in their jobdb mirror via the GC skip, so today's failover has *no* gap and leader-only feeding would have been a regression; (b) makes feed-then-GC atomic within one function with no error return between them, eliminating a lost-penalty race v1 had (cycle error between the committed `syncState` GC and the leader-block feed permanently lost the charge, because the re-fetched job row recreates the job without runs — `reconciliation.go:162-166` — which fails the gate); and (c) removes any dependency on `updatedJobs`, making the `updateAll`-failover `txn.GetAll()` hazard structurally impossible rather than merely avoided.
+3. **Missed compile-site (fixed):** `Schedule` is called through the `SchedulingAlgo` interface (`scheduling_algo.go:38-41`), implemented also by `testSchedulingAlgo` (`scheduler_test.go:2138`, `:2150`). Both must gain the `now` parameter (Task 3).
+4. **Missed test call sites (fixed):** `syncState` is called directly by tests at `scheduler_test.go:1779` and `:2002` (Task 4).
+5. **Unported assertion (fixed):** the old `TestTimeNotSetReturnsFalse` (zero `now` -> false) now has a counterpart (Task 1).
+6. **Dead code v1 left behind (fixed):** after the `GetAllTerminalJobs` fetch is removed, the jobdb `terminalJobs` index is maintained on every upsert/delete for zero readers. Task 7 deletes the method, the index, and its tests.
+7. **Benchmark compile errors (fixed):** missing `jobdb` import; `ptr` vs `ptrTime` helper inconsistency (now `ptrTime` everywhere, defined once in the service test file).
+8. **`penaltyEntry.heapIndex` removed:** it was written by the heap but never read (no `heap.Fix`/`heap.Remove` use; entries are immutable and removed only via `Pop`).
+9. **Accepted, documented behavior deviation — charge start timing:** see "Lifecycle timing facts" point D. This is the only intentional deviation from today's behavior and it is bounded to one Pulsar round-trip.
+
+Design-decision bullets below have been rewritten where their v1 premises were factually wrong; the changes were made at the plan owner's request ("update the plan according to your findings").
+
+---
+
+## Lifecycle timing facts (verified against the code — the feed design depends on these)
+
+These were verified at `9c8126f` and are the reason the feed looks the way it does. Re-verify the cited lines if the base has moved.
+
+- **(A) Run-level and job-level terminal flags arrive in different cycles.** When a run succeeds, the executor-side event updates only the **runs** table. In that cycle (call it N), `reconcileRunDifferences` sets `rst.Succeeded` -> `jst.Succeeded = true` (`jobdb/reconciliation.go:272-274`), but reconciliation never propagates run state to the job-level flag, so `jst.Job.InTerminalState()` is still false during `syncState`. The job-level flag is set later **in the same cycle, after syncState**, by `generateUpdateMessagesFromJob` (`scheduler.go:957` for success, `:1010` for failure), which upserts the modified job into the cycle txn (`scheduler.go:1057-1060`) and publishes `JobSucceeded`/`JobErrors`.
+- **(B) The round-trip job-row update carries no run rows.** `JobSucceeded` maps to `MarkJobsSucceeded` and terminal `JobErrors` to `MarkJobsFailed` — **jobs-table-only** writes (`scheduleringester/instructions.go:300-312`). So at the cycle where the job row lands back (call it N+k), the fetch window contains the job row but no run row: every run-level jst flag is false. A jst is still generated for the job (every job id in the fetch window gets one — `jobdb/reconciliation.go:92, 114-116`), and `jst.Job` is the current jobdb job, which IS job-level terminal (on the leader it was upserted terminal in cycle N; on followers the job-row reconcile at N+k sets it via `reconciliation.go:185-186`).
+- **(C) Consequence:** `jst.Succeeded || jst.Failed || jst.Cancelled` and `jst.Job.InTerminalState()` are **disjoint in time** for the success/failure paths. Only `jst.Job.InTerminalState()` identifies the cycle where the gate can pass. (Cancellation and lease-expiry happen to set both at N+k because their round-trips also touch the run row and `enforceTerminalStateExclusivity` re-raises the rst flag on any run-row touch — `reconciliation.go:284, 291-302` — but the feed must not rely on that.)
+- **(D) Accepted deviation — charge start timing.** Today the penalty starts in cycle N: the per-job scan runs during `Schedule`, after `generateUpdateMessagesFromJob` has upserted the job-level flag. The service charges at cycle N+k, when the job-level terminal flag round-trips through Pulsar/ingester into the jobs table (typically one or two cycles, i.e. seconds). The expiry deadline (`runStart + cutoff`) is unchanged, so the charged window shrinks by the round-trip latency — a small, bounded under-penalization relative to cutoffs measured in minutes. This is the only intended behavior change and Task 4's two-phase test pins it down explicitly.
+- **(E) GC timing under the new design.** In cycle N the jst's job is not yet job-level terminal, so the (unconditional) GC does not delete it — `generateUpdateMessagesFromJob` still finds it. At N+k the jst's job is terminal: the feed charges it and the GC deletes it, in that order, inside the same `syncState` call with no error return between. jobdb retention for terminal jobs drops from "cutoff + up to 10 cycles" to "one Pulsar round-trip".
+
+### Failure-mode walk-through (why there are no lost or double charges)
+
+The service is in-memory and the jobdb txn is transactional; the DB cursors (`jobsSerial`/`runsSerial`) only advance after a successful publish on the leader (`scheduler.go:391-392`) or at the non-leader early-out (`scheduler.go:287-288`). Walking every failure point:
+
+1. **Error in `syncState` before the feed** (fetch, reconcile, upsert): txn aborted, cursors not advanced, nothing charged. Next cycle re-fetches the same rows and retries from scratch.
+2. **Error in `syncState` after the feed, before commit** (`BatchDelete`): service charged, txn aborted, cursors not advanced. Next cycle re-derives the same jsts; `ReportFinishedJob` dedups by job id (`byId`), so the re-report is a no-op. No double charge, no loss.
+3. **Error anywhere after `syncState` committed** (leader block: run-error fetch, submit check, scheduling, publish): the charge already happened inside `syncState`. Cursors not advanced -> the job row is re-fetched next cycle; even though the job was GC'd and its run rows' serials are already consumed (so the row-recreated job has no runs and would fail the gate — `reconciliation.go:162-166`), the `byId` dedup short-circuits first. No loss (already charged), no double charge.
+4. **Leader failover:** followers run the same `syncState` feed against the same DB stream, so the new leader's service already holds the penalties. No failover gap (matches today, where followers retain terminal short jobs in jobdb via the GC skip).
+5. **Cold restart:** in-memory state is lost and `FetchInitialJobs` filters terminated jobs, so jobs already job-level terminal in the DB are never re-fetched -> not penalized for up to one cutoff window. **This matches today exactly** (a restarted scheduler's jobdb also has no terminal jobs for the same reason); it is not a new gap.
+6. **Publish-failure replay:** cursors not advanced -> same rows re-fetched -> same jsts -> `byId` dedup. Post-expiry replay can never re-charge because the expiry deadline (`runStart + cutoff`) and the gate (`now - runStart < cutoff`) are the same inequality over the same immutable `runStart` — an expired entry can never re-qualify, so no tombstones are needed.
+
+---
+
+## Design decisions locked in (updated in Revision 2)
+
+- **No `ReportDeletedJob`.** Finish/terminal event + lazy time-based expiry fully reproduces today's behavior. Deletion events are not added (they reintroduce double-count/ordering hazards for no benefit). *(Unchanged from v1.)*
+- **Terminal candidate check = `jst.Job.InTerminalState()`** (job-level `Succeeded || Failed || Cancelled`), evaluated at the feed call site. **Never use the jst run-level transition flags** (`jst.Succeeded` etc.) — they are false on the only cycle where the job qualifies (Lifecycle facts A-C). Cancel-while-running short jobs ARE penalized today; the job-level check preserves that (the job-level cancelled flag round-trips like the others).
+- **The candidate check is only a cheap pre-filter.** The real gate is `shouldApplyPenalty(job, now)`, ported verbatim from `ShortJobPenalty.ShouldApplyPenalty`. It does double duty: today-parity filter AND post-expiry dedup (failure-mode point 6).
+- **One pinned cycle-start `now`,** threaded as an explicit parameter: `Run`'s per-tick `start` -> `cycle(..., now)` -> `syncState(..., now)` (write path) and `Schedule(ctx, txn, now)` (read path). No `SetNow` setter. No `time.Now()` at call sites. `initialise` passes `s.clock.Now()` to its `syncState` call (harmless: initial jobs are non-terminal, the gate rejects everything).
+- **Feed runs in `syncState`, every cycle, on every node** (leader and followers), after `ReconcileDifferences`/upsert and before GC. Rationale: failover parity, feed/GC atomicity, structural immunity to the `updateAll` `txn.GetAll()` hazard (Revision 2 changelog, point 2). The feed never touches `updatedJobs`.
+- **GC becomes unconditional in `syncState`.** It no longer consults the penalty. The `fullJobGc` parameter and the `cycleNumber%10==0` full-sweep exist solely to eventually collect short jobs the per-cycle GC skipped; both are removed. The `terminalJobs` jobdb index then has zero readers and is removed too (Task 7).
+- **Cold-restart gap accepted; failover gap eliminated.** See failure-mode points 4-5. The cold-restart behavior is identical to today's; no restart-rebuild DB query.
+- **Charge start moves from cycle N to cycle N+k** (one Pulsar round-trip later); expiry deadline unchanged. Accepted and pinned by test (Lifecycle fact D).
 - **Cutoff is keyed per-pool** (`cutoffs[pool]`). Config is restart-only; no hot reload. An unconfigured pool yields cutoff `0`, so `now - runStart < 0` is always false -> never penalized (matches today, short_job_penalty.go:52).
-- **No mutex.** Verified single-goroutine access: zero goroutines in `scheduling_algo.go`, `queue_scheduler.go`, `preempting_queue_scheduler.go`, `scheduler.go`. The cycle loop is the only writer/reader; Prometheus reads the copied `queueContext.ShortJobPenalty` snapshot, never the live service. Do not add a lock for future-proofing.
+- **No mutex.** Verified single-goroutine access: zero goroutines in `scheduling_algo.go`, `queue_scheduler.go`, `preempting_queue_scheduler.go`, `scheduler.go`. The cycle loop is the only writer/reader; Prometheus reads the copied `queueContext.ShortJobPenalty` snapshot (`metrics/cycle_metrics.go:573, :828`), never the live service. Do not add a lock for future-proofing.
+- **Known harmless parity nuance:** the old per-job scan skipped jobs whose queue no longer exists (`scheduling_algo.go:590-594`); the service will briefly hold sums for such queues. Downstream consumption is keyed by existing queues (`AddQueueSchedulingContext`), so the extra entries are never read, and they expire within one cutoff window. Do not add queue-existence filtering to the service.
 
 ---
 
@@ -30,17 +71,19 @@ These were resolved with the requesting engineer and must not be re-litigated du
 
 **Create:**
 - `internal/scheduler/scheduling/short_job_penalty_service.go` - the new service: `ShortJobPenaltyService`, `penaltyEntry`, the deadline min-heap, `ReportFinishedJob`, `GetPenaltiesForPool`, internal `expireUpTo`. The existing `ShouldApplyPenalty` qualification logic folds in here as an internal method taking `(job, now)`.
-- `internal/scheduler/scheduling/short_job_penalty_service_test.go` - unit tests for the service (qualification parity, accumulation, lazy expiry, dedup, multi-pool isolation, per-pool cutoff, post-expiry non-re-qualification).
+- `internal/scheduler/scheduling/short_job_penalty_service_test.go` - unit tests for the service (qualification parity incl. zero-`now`, accumulation, lazy expiry, dedup, multi-pool isolation, per-pool cutoff, post-expiry non-re-qualification).
 - `internal/scheduler/scheduling/short_job_penalty_service_bench_test.go` - the 50K-short-job benchmark for the perf AC.
 
 **Modify:**
-- `internal/scheduler/scheduling/short_job_penalty.go` - DELETE this file (the old `ShortJobPenalty` type, `NewShortJobPenalty`, `SetNow`, `ShouldApplyPenalty`). Its logic moves into the service file. (Keep the old test file's parity assertions by porting them to the service test.)
-- `internal/scheduler/scheduling/short_job_penalty_test.go` - DELETE (ported into the service test).
-- `internal/scheduler/scheduling/scheduling_algo.go` - struct field type change; thread `now` through `Schedule` -> `runPoolSchedulingRound` -> `newFairSchedulingAlgoContext` -> `calculateJobSchedulingInfo`; replace the per-job penalty branch with a `GetPenaltiesForPool` call; drop `GetAllTerminalJobs` from the scheduling round; remove the terminal-job penalty branch.
-- `internal/scheduler/scheduler.go` - thread `now` into `cycle`; add the leader-only penalty feed beside the `ReportStateTransitions` loop; remove `SetNow` calls; make `syncState` GC unconditional and drop the `fullJobGc` param + full-sweep.
-- `internal/scheduler/schedulerapp.go` - construct `NewShortJobPenaltyService` instead of `NewShortJobPenalty`.
-- `internal/scheduler/scheduling/scheduling_algo_test.go` - update `Schedule(ctx, txn)` calls to the new signature; pass a service (or `nil`) to `NewFairSchedulingAlgo`.
-- `internal/scheduler/scheduler_test.go` - update `cycle(...)` calls to the new signature.
+- `internal/scheduler/scheduling/short_job_penalty.go` - DELETE this file (the old `ShortJobPenalty` type, `NewShortJobPenalty`, `SetNow`, `ShouldApplyPenalty`). Its logic moves into the service file.
+- `internal/scheduler/scheduling/short_job_penalty_test.go` - DELETE (every assertion ported into the service test, including the zero-`now` case).
+- `internal/scheduler/scheduling/scheduling_algo.go` - **`SchedulingAlgo` interface gains `now time.Time` (:38-41)**; struct field type change (:62); constructor param type (:74); thread `now` through `Schedule` (:109) -> `runPoolSchedulingRound` (:203) -> `newFairSchedulingAlgoContext` (:411) -> `calculateJobSchedulingInfo` (:579); replace the per-job penalty branch (:596-602) with a `GetPenaltiesForPool` call; drop `GetAllTerminalJobs` from the scheduling round (:441, :445) and its comment bullet (:436-437).
+- `internal/scheduler/scheduler.go` - thread `now` into `cycle` (:266) and `syncState` (:426); move the penalty feed into `syncState` (all nodes, before GC); remove `SetNow` calls (:153, :172); make `syncState` GC unconditional and drop the `fullJobGc` param + full-sweep; update call sites (:211, :273, :362, :1263); `Scheduler` struct field (:71) and `NewScheduler` param (:109) type change.
+- `internal/scheduler/schedulerapp.go` - construct `NewShortJobPenaltyService` instead of `NewShortJobPenalty` (:350).
+- `internal/scheduler/scheduling/scheduling_algo_test.go` - update the three `Schedule(ctx, txn)` calls (:73, :216, :980) and, where penalty behavior is exercised, the three `NewFairSchedulingAlgo` calls (:55, :196, :922).
+- `internal/scheduler/scheduler_test.go` - update `testSchedulingAlgo.Schedule` (:2150), the `cycle(...)` calls (:1058, :1225, :1232, :1297, :3328), the direct `syncState(...)` calls (:1779, :2002); add the two-phase lifecycle test.
+- `internal/scheduler/jobdb/jobdb.go` - DELETE `GetAllTerminalJobs` (:960-963) and the `terminalJobs` index + maintenance (:75, :140, :148, :181, :356, :379, :402, :447-448, :476, :618-619, :801-815, :1037-1038).
+- `internal/scheduler/jobdb/jobdb_test.go` - DELETE the three terminal-index tests (`TestJobDb_TestGetTerminalJobs` :150, `TestJobDb_TerminalJobs_Lifecycle` :170, `TestJobDb_TerminalJobs_Deleted` :195).
 
 ---
 
@@ -55,7 +98,7 @@ The qualification gate is ported verbatim from `short_job_penalty.go:29-53`, cha
 
 - [ ] **Step 1: Write the failing test (qualification parity)**
 
-Create `internal/scheduler/scheduling/short_job_penalty_service_test.go`. This ports every assertion from the old `short_job_penalty_test.go` to the new service surface, replacing `SetNow(now)` + `ShouldApplyPenalty(job)` with `shouldApplyPenalty(job, now)`.
+Create `internal/scheduler/scheduling/short_job_penalty_service_test.go`. This ports every assertion from the old `short_job_penalty_test.go` to the new service surface, replacing `SetNow(now)` + `ShouldApplyPenalty(job)` with `shouldApplyPenalty(job, now)`. Note `TestService_ZeroNowReturnsFalse` ports the old `TestTimeNotSetReturnsFalse`.
 
 ```go
 package scheduling
@@ -74,6 +117,11 @@ func TestService_NilServiceQualificationReturnsFalse(t *testing.T) {
 	var nilSvc *ShortJobPenaltyService = nil
 	job := shortServiceTestJob(time.Now()).WithSucceeded(true)
 	assert.False(t, nilSvc.shouldApplyPenalty(job, time.Now()))
+}
+
+func TestService_ZeroNowReturnsFalse(t *testing.T) {
+	job := shortServiceTestJob(time.Now()).WithSucceeded(true)
+	assert.False(t, makeServiceSut().shouldApplyPenalty(job, time.Time{}))
 }
 
 func TestService_LongSucceededJobReturnsFalse(t *testing.T) {
@@ -148,10 +196,20 @@ func longServiceTestJob(now time.Time) *jobdb.Job {
 }
 
 func serviceTestJob(runningTime time.Time) *jobdb.Job {
-	job := testfixtures.Test32Cpu256GiJob("q", testfixtures.PriorityClass2).WithNewRun("testExecutor", "test-node", "node", testfixtures.TestPool, 5)
+	return serviceTestJobForPool("q", testfixtures.TestPool, runningTime)
+}
+
+func serviceTestJobForQueue(queue string, runningTime time.Time) *jobdb.Job {
+	return serviceTestJobForPool(queue, testfixtures.TestPool, runningTime)
+}
+
+func serviceTestJobForPool(queue string, pool string, runningTime time.Time) *jobdb.Job {
+	job := testfixtures.Test32Cpu256GiJob(queue, testfixtures.PriorityClass2).WithNewRun("testExecutor", "test-node", "node", pool, 5)
 	run := job.LatestRun()
 	return job.WithUpdatedRun(run.WithRunningTime(&runningTime))
 }
+
+func ptrTime(t time.Time) *time.Time { return &t }
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -184,8 +242,6 @@ type penaltyEntry struct {
 	// deadline is runStart + cutoff[pool], fixed at insert from the immutable run
 	// start time. It never changes, which is what makes lazy heap-expiry clean.
 	deadline time.Time
-	// heapIndex is maintained by the heap implementation; unused outside it.
-	heapIndex int
 }
 
 // ShortJobPenaltyService owns short-job-penalty state keyed by (pool, queue).
@@ -239,21 +295,16 @@ func (s *ShortJobPenaltyService) shouldApplyPenalty(job *jobdb.Job, now time.Tim
 }
 
 // entryHeap is a min-heap of penaltyEntry ordered by deadline. Implements
-// container/heap.Interface.
+// container/heap.Interface. Entries are immutable and only ever removed via
+// Pop (no heap.Fix/heap.Remove), so no back-index is maintained.
 type entryHeap []*penaltyEntry
 
-func (h entryHeap) Len() int            { return len(h) }
-func (h entryHeap) Less(i, j int) bool  { return h[i].deadline.Before(h[j].deadline) }
-func (h entryHeap) Swap(i, j int) {
-	h[i], h[j] = h[j], h[i]
-	h[i].heapIndex = i
-	h[j].heapIndex = j
-}
+func (h entryHeap) Len() int           { return len(h) }
+func (h entryHeap) Less(i, j int) bool { return h[i].deadline.Before(h[j].deadline) }
+func (h entryHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
 
 func (h *entryHeap) Push(x any) {
-	e := x.(*penaltyEntry)
-	e.heapIndex = len(*h)
-	*h = append(*h, e)
+	*h = append(*h, x.(*penaltyEntry))
 }
 
 func (h *entryHeap) Pop() any {
@@ -297,11 +348,6 @@ git commit -m "feat(scheduler): add ShortJobPenaltyService skeleton with qualifi
 Append to `internal/scheduler/scheduling/short_job_penalty_service_test.go`:
 
 ```go
-import (
-	// add to the existing import block:
-	"github.com/armadaproject/armada/internal/scheduler/internaltypes"
-)
-
 func TestService_AccumulatesPerQueue(t *testing.T) {
 	now := time.Now()
 	svc := makeServiceSut()
@@ -329,6 +375,16 @@ func TestService_NonQualifyingJobIsNotCharged(t *testing.T) {
 
 	penalties := svc.GetPenaltiesForPool(testfixtures.TestPool, now)
 	assert.Empty(t, penalties)
+}
+
+func TestService_NonTerminalJobIsNotCharged(t *testing.T) {
+	now := time.Now()
+	svc := makeServiceSut()
+
+	runningJob := shortServiceTestJob(now) // short but still running
+	svc.ReportFinishedJob(runningJob, now)
+
+	assert.Empty(t, svc.GetPenaltiesForPool(testfixtures.TestPool, now))
 }
 
 func TestService_DedupSameJobReportedTwice(t *testing.T) {
@@ -399,19 +455,9 @@ func TestService_GetPenaltiesForUnknownPoolIsEmpty(t *testing.T) {
 	svc := makeServiceSut()
 	assert.Empty(t, svc.GetPenaltiesForPool("does-not-exist", now))
 }
-
-func serviceTestJobForQueue(queue string, runningTime time.Time) *jobdb.Job {
-	return serviceTestJobForPool(queue, testfixtures.TestPool, runningTime)
-}
-
-func serviceTestJobForPool(queue string, pool string, runningTime time.Time) *jobdb.Job {
-	job := testfixtures.Test32Cpu256GiJob(queue, testfixtures.PriorityClass2).WithNewRun("testExecutor", "test-node", "node", pool, 5)
-	run := job.LatestRun()
-	return job.WithUpdatedRun(run.WithRunningTime(&runningTime))
-}
 ```
 
-Note: `Test32Cpu256GiJob(queue, ...)` sets the job's queue from the first argument; confirm via `testfixtures` if `AllResourceRequirements()` is non-empty for this fixture (it is - it's a 32-CPU job).
+Note: `Test32Cpu256GiJob(queue, ...)` sets the job's queue from the first argument, generates a unique ULID job id per call, and `AllResourceRequirements()` is non-empty for this fixture (32-CPU job).
 
 - [ ] **Step 2: Run tests to verify they fail**
 
@@ -423,10 +469,15 @@ Expected: FAIL - `ReportFinishedJob` and `GetPenaltiesForPool` undefined.
 Append to `internal/scheduler/scheduling/short_job_penalty_service.go`:
 
 ```go
-// ReportFinishedJob is called every cycle, leader-only, for each terminal-state
-// transition (Succeeded || Failed || Cancelled). The JST flag is only a cheap
-// pre-filter; shouldApplyPenalty is the authoritative gate. now must be the
-// pinned cycle-start time.
+// ReportFinishedJob is called from syncState on every node, for each
+// job-state-transition whose job is in a job-level terminal state
+// (job.InTerminalState()). shouldApplyPenalty is the authoritative gate;
+// callers may pre-filter on job.InTerminalState() as an optimization but must
+// NOT pre-filter on the jst run-level transition flags (see plan: "Lifecycle
+// timing facts"). now must be the pinned cycle-start time. Re-reports of an
+// already-counted job are no-ops (dedup by job id); reports after the entry
+// expired can never re-qualify (the gate and the expiry deadline are the same
+// inequality over the immutable run start).
 func (s *ShortJobPenaltyService) ReportFinishedJob(job *jobdb.Job, now time.Time) {
 	if s == nil {
 		return
@@ -515,7 +566,7 @@ func (s *ShortJobPenaltyService) subtractFromSums(pool, queue string, resources 
 }
 ```
 
-Note on `AllZero`: `internaltypes.ResourceList.AllZero()` exists (resource_list.go:108) and reports "all resource quantities are zero". After subtracting the last contribution the value is non-empty-factory but all-zero, so `AllZero()` is the correct prune check. Do NOT use `IsEmpty()` here - that only checks the factory is nil, which is never true for a summed value.
+Note on `AllZero`: `internaltypes.ResourceList.AllZero()` exists (resource_list.go:108) and reports "all resource quantities are zero". After subtracting the last contribution the value is non-empty-factory but all-zero, so `AllZero()` is the correct prune check. Do NOT use `IsEmpty()` here - that only checks the factory is nil (resource_list.go:145), which is never true for a summed value.
 
 - [ ] **Step 4: Run tests to verify they pass**
 
@@ -531,10 +582,11 @@ git commit -m "feat(scheduler): implement ShortJobPenaltyService report/get/lazy
 
 ---
 
-## Task 3: Thread `now` through the read path and call the service in calculateJobSchedulingInfo
+## Task 3: Thread `now` through the read path (interface + impl + mock) and call the service in calculateJobSchedulingInfo
 
 **Files:**
 - Modify: `internal/scheduler/scheduling/scheduling_algo.go`
+  - **`SchedulingAlgo` interface (:38-41): `Schedule(*armadacontext.Context, *jobdb.Txn, time.Time) (*SchedulerResult, error)`**
   - struct field `shortJobPenalty *ShortJobPenalty` (:62) -> `shortJobPenalty *ShortJobPenaltyService`
   - `NewFairSchedulingAlgo` param `shortJobPenalty *ShortJobPenalty` (:74) -> `*ShortJobPenaltyService`
   - `Schedule` (:109) gains a `now time.Time` parameter
@@ -542,26 +594,29 @@ git commit -m "feat(scheduler): implement ShortJobPenaltyService report/get/lazy
   - `newFairSchedulingAlgoContext` (:411) gains `now time.Time`
   - `calculateJobSchedulingInfo` (:579) gains `now time.Time`; replace the per-job penalty branch (:596-602) with a single `GetPenaltiesForPool` call
   - drop `terminalJobs := txn.GetAllTerminalJobs()` (:441) and its append (:445)
+- Modify: `internal/scheduler/scheduler_test.go` - **`testSchedulingAlgo.Schedule` (:2150) gains the `now` parameter** (it can ignore the value). Do this in the same commit as the interface change or the package will not compile.
 - Modify: `internal/scheduler/scheduling/scheduling_algo_test.go` - update the three `Schedule(ctx, txn)` calls (:73, :216, :980) and the three `NewFairSchedulingAlgo` calls (:55, :196, :922)
 
-This is the most mechanically invasive task. The `now` plumbing chain is: `Schedule(ctx, txn, now)` -> `runPoolSchedulingRound(ctx, pool, txn, executors, now)` -> `newFairSchedulingAlgoContext(ctx, txn, executors, pool, now)` -> `calculateJobSchedulingInfo(..., now)`.
+Note: `internal/scheduler/scheduler.go:362` (`s.schedulingAlgo.Schedule(ctx, txn)`) also calls through the interface; it is updated in Task 4 together with the `cycle` signature change. To keep every commit compiling, Tasks 3 and 4 may be landed as one commit if needed; otherwise pass `s.clock.Now()` temporarily at :362 in this task and replace it with the threaded `now` in Task 4. **Do not forget to replace it** - Task 4 Step 3a includes the replacement.
+
+The `now` plumbing chain is: `Schedule(ctx, txn, now)` -> `runPoolSchedulingRound(ctx, pool, txn, executors, now)` -> `newFairSchedulingAlgoContext(ctx, txn, executors, pool, now)` -> `calculateJobSchedulingInfo(..., now)`.
 
 - [ ] **Step 1: Write the failing test (service-driven penalty in scheduling info)**
 
-Add to `internal/scheduler/scheduling/scheduling_algo_test.go` a test that builds a `FairSchedulingAlgo` with a populated `ShortJobPenaltyService` and asserts the penalty reaches the queue scheduling context. Because the full `Schedule` path needs executors/nodes, scope this to `calculateJobSchedulingInfo` directly if the existing harness supports it; otherwise assert via the existing `Schedule` harness that `QueueSchedulingContexts[q].ShortJobPenalty` equals the service's reported value.
+Add to `internal/scheduler/scheduling/scheduling_algo_test.go` a test that builds a `FairSchedulingAlgo` with a populated `ShortJobPenaltyService` and asserts the penalty reaches the queue scheduling context. Because the full `Schedule` path needs executors/nodes, copy the harness setup from an existing `TestSchedule_*` case and inject the service:
 
 ```go
 func TestSchedule_ShortJobPenaltyComesFromService(t *testing.T) {
 	// Build the standard single-pool scheduling harness used by the other
-	// TestSchedule_* cases (copy the setup from TestSchedule_PoolFailureIsolation),
-	// but inject a service pre-populated with one short job for queue "A".
+	// TestSchedule_* cases, but inject a service pre-populated with one short
+	// job for queue "A".
 	now := time.Now()
 	svc := NewShortJobPenaltyService(map[string]time.Duration{testfixtures.TestPool: time.Minute})
 
 	shortJob := testfixtures.Test32Cpu256GiJob("A", testfixtures.PriorityClass2).
 		WithNewRun("testExecutor", "test-node", "node", testfixtures.TestPool, 5).
 		WithSucceeded(true)
-	shortJob = shortJob.WithUpdatedRun(shortJob.LatestRun().WithRunningTime(ptr(now.Add(-10 * time.Second))))
+	shortJob = shortJob.WithUpdatedRun(shortJob.LatestRun().WithRunningTime(ptrTime(now.Add(-10 * time.Second))))
 	svc.ReportFinishedJob(shortJob, now)
 
 	sch, err := NewFairSchedulingAlgo(
@@ -583,23 +638,34 @@ func TestSchedule_ShortJobPenaltyComesFromService(t *testing.T) {
 	result, err := sch.Schedule(ctx, txn, now)
 	require.NoError(t, err)
 
-	sctx := result.PoolResults[0].SchedulingResult.SchedulingContext
+	sctx := result.PoolResults[0].GetSchedulingContext()
+	require.NotNil(t, sctx)
 	qctx := sctx.QueueSchedulingContexts["A"]
 	require.NotNil(t, qctx)
 	assert.True(t, qctx.ShortJobPenalty.Equal(shortJob.AllResourceRequirements()))
 }
 ```
 
-(`ptr` is a local test helper for taking the address of a value; if the test file lacks one, use a `tmp := ...; &tmp` pattern matching the file's existing style.)
+(`ptrTime` is defined in `short_job_penalty_service_test.go`, same package - reuse it; do not define a second helper.)
 
 - [ ] **Step 2: Run test to verify it fails**
 
 Run: `go test ./internal/scheduler/scheduling/ -run TestSchedule_ShortJobPenaltyComesFromService -v`
 Expected: FAIL - `Schedule` does not take a `now` argument / `NewFairSchedulingAlgo` type mismatch.
 
-- [ ] **Step 3a: Change the struct field and constructor type**
+- [ ] **Step 3a: Change the interface, struct field, and constructor type**
 
 In `internal/scheduler/scheduling/scheduling_algo.go`:
+
+Lines 38-41, change the interface:
+```go
+type SchedulingAlgo interface {
+	// Schedule should assign jobs to nodes.
+	// Any jobs that are scheduled should be marked as such in the JobDb using the transaction provided.
+	// now is the pinned cycle-start time used for short-job-penalty reads.
+	Schedule(*armadacontext.Context, *jobdb.Txn, time.Time) (*SchedulerResult, error)
+}
+```
 
 Line 62, change:
 ```go
@@ -620,6 +686,11 @@ to:
 ```
 
 (The assignment at :96 `shortJobPenalty: shortJobPenalty,` is unchanged.)
+
+In `internal/scheduler/scheduler_test.go` line 2150, change the mock:
+```go
+func (t *testSchedulingAlgo) Schedule(_ *armadacontext.Context, txn *jobdb.Txn, _ time.Time) (*scheduling.SchedulerResult, error) {
+```
 
 - [ ] **Step 3b: Thread `now` through Schedule -> runPoolSchedulingRound -> newFairSchedulingAlgoContext**
 
@@ -727,11 +798,11 @@ Just before the `return` at :681, populate from the service:
 	shortJobPenaltyByQueue := l.shortJobPenalty.GetPenaltiesForPool(currentPool, now)
 ```
 
-The returned struct literal (:681-688) is unchanged - it still references `shortJobPenaltyByQueue`.
+The returned struct literal (:681-688) is unchanged - it still references `shortJobPenaltyByQueue`. (The service may include entries for queues that no longer exist; that is fine - `AddQueueSchedulingContext` consumption is keyed by existing queues, see Design decisions.)
 
-- [ ] **Step 3e: Update the internal optimal-scheduler Schedule call**
+- [ ] **Step 3e: Do NOT touch the internal optimal-scheduler Schedule call**
 
-At :864 there is `result, err := scheduler.Schedule(ctx)` - this is a *different* `Schedule` (the queue scheduler / optimal scheduler), NOT `FairSchedulingAlgo.Schedule`. Confirm by inspecting the receiver type at that line. Do NOT add `now` to it. (Verified during planning: the `FairSchedulingAlgo.Schedule` callers are scheduler.go:362 and the three algo tests.)
+At :864 there is `result, err := scheduler.Schedule(ctx)` - this is a *different* `Schedule` (the queue scheduler / optimal scheduler), NOT `FairSchedulingAlgo.Schedule`. Confirm by inspecting the receiver type at that line. Do NOT add `now` to it. (Verified: the `SchedulingAlgo.Schedule` callers are scheduler.go:362, the mock at scheduler_test.go:2150, and the three algo tests.)
 
 - [ ] **Step 3f: Update the algo test call sites**
 
@@ -739,55 +810,91 @@ In `internal/scheduler/scheduling/scheduling_algo_test.go`:
 - The three `NewFairSchedulingAlgo(...)` calls (:55, :196, :922) currently pass `nil` for the penalty arg (verified at :64). `nil` is still valid for the `*ShortJobPenaltyService` typed parameter, so they compile unchanged - but for the cases that exercise penalty behavior, pass a real `NewShortJobPenaltyService(...)`. The skeleton cases can keep `nil`.
 - The three `sch.Schedule(ctx, txn)` calls (:73, :216, :980) become `sch.Schedule(ctx, txn, time.Now())` (or a fixed test clock value where determinism matters).
 
+- [ ] **Step 3g: Keep scheduler.go compiling**
+
+If landing Task 3 as its own commit, change `internal/scheduler/scheduler.go:362` to `s.schedulingAlgo.Schedule(ctx, txn, s.clock.Now())` as a stopgap (replaced by the threaded `now` in Task 4 Step 3a). Note the `Scheduler` struct field `shortJobPenalty *scheduling.ShortJobPenalty` (scheduler.go:71) and `NewScheduler` param (:109) do not need to change yet - they change in Task 5 - but if the compiler complains after the constructor type change, move that type change forward into this commit; both orderings are acceptable as long as every commit builds.
+
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `go test ./internal/scheduler/scheduling/ -v`
-Expected: PASS (existing `TestSchedule_*` plus the new `TestSchedule_ShortJobPenaltyComesFromService`).
+Run: `go test ./internal/scheduler/scheduling/ -v` and `go build ./internal/scheduler/...`
+Expected: PASS / builds (existing `TestSchedule_*` plus the new `TestSchedule_ShortJobPenaltyComesFromService`).
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add internal/scheduler/scheduling/scheduling_algo.go internal/scheduler/scheduling/scheduling_algo_test.go
+git add internal/scheduler/scheduling/scheduling_algo.go internal/scheduler/scheduling/scheduling_algo_test.go internal/scheduler/scheduler.go internal/scheduler/scheduler_test.go
 git commit -m "feat(scheduler): read short-job penalty from service; drop terminal-job scan"
 ```
 
 ---
 
-## Task 4: Wire the leader-only feed + thread `now` into cycle; simplify syncState GC
+## Task 4: Feed the service from syncState (all nodes), thread `now` into cycle/syncState, make GC unconditional
 
 **Files:**
 - Modify: `internal/scheduler/scheduler.go`
-  - `cycle` (:266) gains a `now time.Time` parameter; pass it to `schedulingAlgo.Schedule` (:362)
-  - add the leader-only penalty feed in the leader block (after :324 `ReportStateTransitions`), iterating `jsts`
+  - `cycle` (:266) gains a `now time.Time` parameter; pass it to `syncState` (:273) and `schedulingAlgo.Schedule` (:362)
+  - `syncState` (:426): drop the `fullJobGc` param, gain `now time.Time`; add the penalty feed after the upsert block and before GC; GC unconditionally; remove the `ShouldApplyPenalty` skip
   - remove `SetNow` calls (:153, :172)
   - `Run` passes its pinned `start` into `cycle` (:211)
-  - `syncState` (:426): drop the `fullJobGc` param, GC unconditionally, remove the `ShouldApplyPenalty` skip
-  - the `syncState` call at :273 drops the `cycleNumber%10 == 0` arg; the initial call at :1263 drops its `false` arg
-- Modify: `internal/scheduler/scheduler_test.go` - update `cycle(...)` calls (:1058, :1225, :1232, :1297, :3328)
+  - the initialise-path `syncState` call (:1263) passes `s.clock.Now()`
+- Modify: `internal/scheduler/scheduler_test.go` - update `cycle(...)` calls (:1058, :1225, :1232, :1297, :3328) and the direct `syncState(...)` calls (:1779, :2002); add the two-phase lifecycle test
 
-- [ ] **Step 1: Write the failing test (terminal short job feeds the service via cycle, GC deletes it)**
+- [ ] **Step 1: Write the failing test (two-phase terminal flow: run row first, job row later)**
 
-Add to `internal/scheduler/scheduler_test.go` a test asserting that after a cycle in which a short job goes terminal: (a) the job is deleted from jobdb (GC no longer skips it), and (b) the penalty service has charged it. Use the existing scheduler test harness (`schedulingConfig`, `NewScheduler`, leader token). Model it on the existing cycle tests around :1058.
+**This test exists to catch exactly the bug that killed Revision 1** (Lifecycle facts A-C). It MUST deliver the run-terminal row and the job-terminal row in *different* cycles - do not seed both in one fetch window, or the test will pass against broken feed designs.
+
+Add to `internal/scheduler/scheduler_test.go`, modeled on the existing cycle harness (see :1000-1065 for construction; `testJobRepository` at :2064 returns its `updatedJobs`/`updatedRuns` fields verbatim on each fetch, so mutate those fields between cycles; the multi-cycle pattern at :1225-1232 shows two sequential `cycle` calls):
 
 ```go
-func TestCycle_TerminalShortJobIsGcdAndPenaltyCharged(t *testing.T) {
-	// Build a scheduler via the standard test harness with a real
-	// ShortJobPenaltyService injected (cutoff 1m on the test pool).
-	// Seed jobdb with a job that transitions to Succeeded this cycle, with a
-	// run that started 10s ago on the test pool.
-	// After sched.cycle(ctx, false, leaderToken, true, 1, now):
-	//   - assert txn.GetById(jobId) == nil (deleted by unconditional GC)
-	//   - assert sched.shortJobPenalty.GetPenaltiesForPool(pool, now)[queue] equals the job's requirements
-	// Exact harness setup mirrors the existing TestScheduler_* cycle cases.
+func TestCycle_ShortJobPenalty_TwoPhaseTerminalFlow(t *testing.T) {
+	// Harness: real ShortJobPenaltyService (cutoff 1m on the test pool) injected
+	// into NewScheduler; standalone (always-leader) controller; fake clock.
+	// Seed jobdb with a leased, running job (run started 10s before the fake
+	// clock's now) and the matching DB rows in testJobRepository.initialJobs/
+	// initialRuns so serials line up.
+	//
+	// Phase A - cycle 1: deliver ONLY the run row with Succeeded=true (bump its
+	// Serial); leave the job row untouched. Run sched.cycle(..., now1). Assert:
+	//   - the penalty service has NOT charged the job yet:
+	//     sched.shortJobPenalty.GetPenaltiesForPool(pool, now1) is empty
+	//     (run-level terminal arrived, job-level flag had not at syncState time;
+	//     this pins the accepted one-round-trip charge delay - Lifecycle fact D)
+	//   - the job is still in jobdb (not GC'd) and is now job-level terminal
+	//     (set by generateUpdateMessagesFromJob): txn.GetById(jobId) != nil and
+	//     .InTerminalState() == true
+	//   - a JobSucceeded event was published (existing publisher assertions).
+	//
+	// Phase B - cycle 2: deliver ONLY the job row with Succeeded=true (bump its
+	// Serial); set updatedRuns to nil. Run sched.cycle(..., now2). Assert:
+	//   - the penalty IS charged:
+	//     sched.shortJobPenalty.GetPenaltiesForPool(pool, now2)[queue] equals
+	//     the job's AllResourceRequirements()
+	//   - the job has been deleted from jobdb by the unconditional GC:
+	//     txn.GetById(jobId) == nil
+	//
+	// Phase C - re-deliver the same job row a third cycle (publish-failure
+	// replay simulation). Assert the penalty total is unchanged (dedup).
+}
+
+func TestCycle_ShortJobPenalty_FollowerFeedsToo(t *testing.T) {
+	// Same two-phase flow, but run the cycles with a non-leader token (see the
+	// failover-style tests around :3300 for obtaining one; cycle exits before
+	// the leader block, so generateUpdateMessages never runs). Assert after
+	// phase B:
+	//   - the penalty IS charged on this follower (the job-row reconcile sets
+	//     the job-level flag via reconciliation.go:185-186, so the syncState
+	//     feed sees it)
+	//   - the job is GC'd from the follower's jobdb.
+	// This pins the failover-parity property (failure-mode point 4).
 }
 ```
 
-(Fill the body using the established harness in `scheduler_test.go`; the existing cycle tests show how to construct the scheduler, leader controller, and seed jobs. The two assertions above are the load-bearing checks.)
+(Fill the bodies using the established harness; the commented assertions are the load-bearing checks. If wiring a real service into `NewScheduler` requires the Task 5 type change first, land Tasks 4 and 5 in one commit - every commit must build.)
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `go test ./internal/scheduler/ -run TestCycle_TerminalShortJobIsGcdAndPenaltyCharged -v`
-Expected: FAIL - `cycle` signature mismatch (no `now` param) and/or service not fed.
+Run: `go test ./internal/scheduler/ -run 'TestCycle_ShortJobPenalty' -v`
+Expected: FAIL - `cycle`/`syncState` signature mismatch and/or service not fed.
 
 - [ ] **Step 3a: Thread `now` into cycle and remove SetNow**
 
@@ -812,39 +919,42 @@ At :211, pass the pinned cycle-start `start` (defined at :171) into `cycle`:
 func (s *Scheduler) cycle(ctx *armadacontext.Context, updateAll bool, leaderToken leaderelection.LeaderToken, shouldSchedule bool, cycleNumber int, now time.Time) error {
 ```
 
-At the scheduling call (:362), pass `now`:
+At the syncState call (:273):
+```go
+	updatedJobs, jsts, newJobsSerial, newRunsSerial, err := s.syncState(ctx, false, now)
+```
+
+At the scheduling call (:362), pass `now` (replacing the Task 3 stopgap if one was used):
 ```go
 		result, err = s.schedulingAlgo.Schedule(ctx, txn, now)
 ```
 
-- [ ] **Step 3b: Add the leader-only penalty feed**
+- [ ] **Step 3b: Add the feed + unconditional GC in syncState**
 
-The leader block begins after the `ValidateToken` gate (:281) returns leader. The existing `ReportStateTransitions` loop is at :324 inside `if s.metrics.LeaderMetricsEnabled()`. Add the feed immediately after that metrics block (still inside the leader path, unconditional on metrics-enabled), iterating `jsts` (NOT `updatedJobs`):
+`syncState` signature (:426), drop `fullJobGc`, add `now`:
+```go
+func (s *Scheduler) syncState(ctx *armadacontext.Context, initial bool, now time.Time) ([]*jobdb.Job, []jobdb.JobStateTransitions, int64, int64, error) {
+```
+
+Immediately after the upsert block (:478-485, `txn.Upsert(jobDbJobs)`), insert the feed - **before** the GC block so feed-then-GC is atomic with no error return between them (failure-mode points 2-3):
 
 ```go
-	// Feed terminal short jobs into the penalty service. Leader-only (we are past
-	// the ValidateToken gate) and every cycle (jsts is populated every cycle). We
-	// iterate jsts, the genuinely-transitioned jobs - never updatedJobs, which is
-	// txn.GetAll() on the updateAll failover path and would re-charge everything.
-	// The JST terminal flags are only a pre-filter; ReportFinishedJob applies the
-	// authoritative qualification gate.
+	// Feed terminal jobs into the short-job-penalty service. This runs on every
+	// node (leader and followers) so the in-memory penalty state survives leader
+	// failover; ReportFinishedJob dedups by job id, so replays after a failed
+	// publish (cursors not advanced) are no-ops. The candidate check is the
+	// job-level InTerminalState - the same condition the GC below uses. Do NOT
+	// filter on jst.Succeeded/Failed/Cancelled: those are run-level transition
+	// flags and are false on the cycle where the job-level terminal flag arrives
+	// from the database, which is the only cycle where the job qualifies.
 	for _, jst := range jsts {
-		if jst.Succeeded || jst.Failed || jst.Cancelled {
+		if jst.Job.InTerminalState() {
 			s.shortJobPenalty.ReportFinishedJob(jst.Job, now)
 		}
 	}
 ```
 
-Place this after the `ReportStateTransitions` metrics block (:322-325) and before `generateUpdateMessages` (:328), so it runs on every leader cycle regardless of `shouldSchedule`.
-
-- [ ] **Step 3c: Make syncState GC unconditional**
-
-`syncState` signature (:426), drop `fullJobGc`:
-```go
-func (s *Scheduler) syncState(ctx *armadacontext.Context, initial bool) ([]*jobdb.Job, []jobdb.JobStateTransitions, int64, int64, error) {
-```
-
-Replace the GC block (:487-510):
+Then replace the GC block (:487-510):
 ```go
 	// Delete jobs in a terminal state.
 	idsOfJobsToDelete := make([]string, 0)
@@ -873,9 +983,10 @@ Replace the GC block (:487-510):
 ```
 with:
 ```go
-	// Delete jobs in a terminal state. Short-job-penalty state is now owned by the
-	// ShortJobPenaltyService, so terminal jobs - including short ones - are deleted
-	// on the normal cadence and never retained in jobdb.
+	// Delete jobs in a terminal state. Short-job-penalty state is owned by the
+	// ShortJobPenaltyService (fed above, before this delete), so terminal jobs -
+	// including short ones - are deleted on the normal cadence and never retained
+	// in jobdb.
 	idsOfJobsToDelete := make([]string, 0)
 	for _, j := range jobDbJobs {
 		if j.InTerminalState() {
@@ -888,28 +999,27 @@ with:
 	}
 ```
 
-- [ ] **Step 3d: Update syncState call sites**
+- [ ] **Step 3c: Update remaining syncState call sites**
 
-At :273:
+At :1263 (the initialise path; initial jobs are non-terminal so the gate rejects everything - the `now` value is immaterial but must be non-zero for clarity):
 ```go
-	updatedJobs, jsts, newJobsSerial, newRunsSerial, err := s.syncState(ctx, false)
+		if _, _, newJobsSerial, newRunsSerial, err := s.syncState(ctx, true, s.clock.Now()); err != nil {
 ```
-At :1263 (the initialise path):
-```go
-		if _, _, newJobsSerial, newRunsSerial, err := s.syncState(ctx, true); err != nil {
-```
-(Verify the surrounding code at :1263 - adapt the assignment to whatever the call expects; only the trailing `fullJobGc` arg is removed.)
 
-- [ ] **Step 3e: Update cycle test call sites**
+In `internal/scheduler/scheduler_test.go`, the direct calls:
+- :1779: `sched.syncState(ctx, true, sched.clock.Now())`
+- :2002: `sched.syncState(ctx, false, sched.clock.Now())`
 
-In `internal/scheduler/scheduler_test.go`, add the `now` argument to each `cycle(...)` call (:1058, :1225, :1232, :1297, :3328). Use the same clock value the test's scheduler uses (e.g. `sched.clock.Now()` or a fixed test time). Example for :1058:
+- [ ] **Step 3d: Update cycle test call sites**
+
+In `internal/scheduler/scheduler_test.go`, add the `now` argument to each `cycle(...)` call (:1058, :1225, :1232, :1297, :3328). Use the same clock the test's scheduler uses. Example for :1058:
 ```go
 			err = sched.cycle(ctx, false, sched.leaderController.GetToken(), true, 1, sched.clock.Now())
 ```
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `go test ./internal/scheduler/ -run TestCycle_TerminalShortJobIsGcdAndPenaltyCharged -v`
+Run: `go test ./internal/scheduler/ -run 'TestCycle_ShortJobPenalty' -v`
 Then: `go test ./internal/scheduler/ -run TestScheduler -v` (regression on the cycle harness)
 Expected: PASS.
 
@@ -917,15 +1027,16 @@ Expected: PASS.
 
 ```bash
 git add internal/scheduler/scheduler.go internal/scheduler/scheduler_test.go
-git commit -m "feat(scheduler): feed penalty service from cycle; unconditional terminal-job GC"
+git commit -m "feat(scheduler): feed penalty service from syncState on all nodes; unconditional terminal-job GC"
 ```
 
 ---
 
-## Task 5: Update schedulerapp wiring
+## Task 5: Update schedulerapp wiring + Scheduler struct types
 
 **Files:**
 - Modify: `internal/scheduler/schedulerapp.go:350` (construction) - both injection points (:361 into the algo, :407 into the scheduler) already pass the same `shortJobPenalty` variable, so only the constructor call changes.
+- Modify: `internal/scheduler/scheduler.go` struct field (:71) and `NewScheduler` param (:109) - if not already moved forward into Task 3/4 to keep commits building.
 
 - [ ] **Step 1: Change the construction**
 
@@ -938,14 +1049,9 @@ to:
 	shortJobPenalty := scheduling.NewShortJobPenaltyService(config.Scheduling.GetShortJobPenaltyCutoffs())
 ```
 
-The variable is still passed at :361 (`NewFairSchedulingAlgo` read side) and :407 (`NewScheduler` write side) unchanged - same instance shared, same topology as today.
+The variable is still passed at :361 (`NewFairSchedulingAlgo` read side) and :407 (`NewScheduler` write side) unchanged - same instance shared, same topology as today. **The shared single instance is required**: the algo reads the same state syncState writes.
 
-- [ ] **Step 2: Verify the package builds**
-
-Run: `go build ./internal/scheduler/...`
-Expected: success, no compile errors. (If `NewScheduler`'s parameter is typed `*scheduling.ShortJobPenalty`, update that field/param in `scheduler.go` struct at :71 and constructor at :109 to `*scheduling.ShortJobPenaltyService` - verified during planning that scheduler.go:71 holds `shortJobPenalty *scheduling.ShortJobPenalty`.)
-
-- [ ] **Step 3: Update the Scheduler struct + constructor type**
+- [ ] **Step 2: Update the Scheduler struct + constructor type (if not already done)**
 
 In `internal/scheduler/scheduler.go`:
 
@@ -957,14 +1063,14 @@ Line 109 (`NewScheduler` param):
 ```go
 	shortJobPenalty *scheduling.ShortJobPenaltyService,
 ```
-(Assignment at :131 unchanged.)
+(Assignment at :131 unchanged. Test call sites passing `nil` for this param compile unchanged.)
 
-- [ ] **Step 4: Build the whole scheduler module**
+- [ ] **Step 3: Build the whole scheduler module**
 
 Run: `go build ./internal/scheduler/...`
 Expected: success.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 4: Commit**
 
 ```bash
 git add internal/scheduler/schedulerapp.go internal/scheduler/scheduler.go
@@ -983,7 +1089,7 @@ git commit -m "refactor(scheduler): wire NewShortJobPenaltyService into app"
 
 Run:
 ```bash
-grep -rn "ShortJobPenalty\b\|NewShortJobPenalty\b\|\.SetNow(\|ShouldApplyPenalty" internal/ --include="*.go" | grep -v "ShortJobPenaltyService\|ShortJobPenaltyByQueue\|ShortJobPenaltyCutoff\|shortJobPenaltyByQueue\|qctx.ShortJobPenalty\|queueContext.ShortJobPenalty\|GetAllocationInclShortJobPenalty\|\.shortJobPenalty\b"
+grep -rn "ShortJobPenalty\b\|NewShortJobPenalty\b\|\.SetNow(\|ShouldApplyPenalty" internal/ --include="*.go" | grep -v "ShortJobPenaltyService\|ShortJobPenaltyByQueue\|ShortJobPenaltyCutoff\|shortJobPenaltyByQueue\|qctx.ShortJobPenalty\|queueContext.ShortJobPenalty\|qCtx.ShortJobPenalty\|GetAllocationInclShortJobPenalty\|\.shortJobPenalty\b"
 ```
 Expected: no output (every reference is to the service, the per-queue field, the config cutoff, or the context accessor - none to the deleted type/methods). If `shouldApplyPenalty` (lowercase, the service's internal method) appears, that's fine - it lives in the service file.
 
@@ -1009,12 +1115,46 @@ git commit -m "refactor(scheduler): remove old ShortJobPenalty type superseded b
 
 ---
 
-## Task 7: Benchmark for the 50K-short-job perf AC
+## Task 7: Remove the now-dead jobdb terminalJobs index
+
+After Task 3, `txn.GetAllTerminalJobs()` has zero production callers, and with prompt GC the `terminalJobs` set is maintained on every upsert/delete for nothing. Removing it is part of the perf win.
+
+**Files:**
+- Modify: `internal/scheduler/jobdb/jobdb.go` - delete `GetAllTerminalJobs` (:960-963) and the `terminalJobs` field/initialisation/copies/maintenance (:75, :140, :148, :181, :356, :379, :402, :447-448, :476, :618-619, :801-815, :1037-1038 - re-locate by grepping `terminalJobs`, line numbers shift as you edit).
+- Modify: `internal/scheduler/jobdb/jobdb_test.go` - delete `TestJobDb_TestGetTerminalJobs` (:150), `TestJobDb_TerminalJobs_Lifecycle` (:170), `TestJobDb_TerminalJobs_Deleted` (:195).
+
+- [ ] **Step 1: Confirm the only callers are jobdb-internal**
+
+Run:
+```bash
+grep -rn "GetAllTerminalJobs\|terminalJobs" internal/ --include="*.go"
+```
+Expected: hits only in `internal/scheduler/jobdb/jobdb.go` and `internal/scheduler/jobdb/jobdb_test.go`. If anything else appears, STOP and resolve it first - do not delete an index with live readers.
+
+- [ ] **Step 2: Delete the method, the field, every maintenance site, and the three tests**
+
+Grep-driven: remove every `terminalJobs` line and its enclosing dead statements (the upsert-path add/replace blocks at ~:801-815, the delete-path removal at ~:1037-1038, the txn copy lines, the struct fields, the constructor init).
+
+- [ ] **Step 3: Build and test jobdb**
+
+Run: `go build ./internal/scheduler/... && go test ./internal/scheduler/jobdb/ -count=1`
+Expected: success / PASS.
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add -A
+git commit -m "perf(scheduler): remove unused jobdb terminalJobs index"
+```
+
+---
+
+## Task 8: Benchmark for the 50K-short-job perf AC
 
 **Files:**
 - Create: `internal/scheduler/scheduling/short_job_penalty_service_bench_test.go`
 
-The perf AC is "no regression in scheduler cycle time when a queue has 50K+ recent short jobs." The real win is structural (terminal short jobs leave jobdb, so the `calculateJobSchedulingInfo` loop and the dropped `GetAllTerminalJobs` fetch no longer traverse them). The service itself must be cheap at 50K live entries: report and get must stay sub-millisecond and allocation-light. This benchmark measures the service in isolation, which is the component this change introduces.
+The perf AC is "no regression in scheduler cycle time when a queue has 50K+ recent short jobs." The real win is structural (terminal short jobs leave jobdb promptly, so the `calculateJobSchedulingInfo` loop and the dropped `GetAllTerminalJobs` fetch no longer traverse them, and jobdb upserts no longer maintain the terminal index). The service itself must be cheap at 50K live entries: report and get must stay sub-millisecond and allocation-light. This benchmark measures the service in isolation, which is the component this change introduces.
 
 - [ ] **Step 1: Write the benchmark**
 
@@ -1025,6 +1165,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/armadaproject/armada/internal/scheduler/jobdb"
 	"github.com/armadaproject/armada/internal/scheduler/testfixtures"
 )
 
@@ -1064,16 +1205,14 @@ func BenchmarkShortJobPenaltyService_GetWith50kLiveEntries(b *testing.B) {
 		_ = svc.GetPenaltiesForPool(testfixtures.TestPool, now)
 	}
 }
-
-func ptrTime(t time.Time) *time.Time { return &t }
 ```
 
-Note: each of the 50K jobs above uses queue "q", so they all accumulate into one `(pool, "q")` sum - which is exactly the AC scenario ("a queue has 50K+ recent short jobs"). `ReportFinishedJob` dedups by `job.Id()`; confirm `Test32Cpu256GiJob` generates a unique job id per call (it does - ids are ULID-generated per construction). If it does not, vary the queue or assign ids explicitly so all 50K are distinct.
+(`ptrTime` is defined in `short_job_penalty_service_test.go`, same package.) All 50K jobs use queue "q", so they accumulate into one `(pool, "q")` sum - exactly the AC scenario. `Test32Cpu256GiJob` generates a unique ULID job id per call, so dedup does not collapse them.
 
 - [ ] **Step 2: Run the benchmark**
 
 Run: `go test ./internal/scheduler/scheduling/ -bench BenchmarkShortJobPenaltyService -benchmem -run '^$'`
-Expected: completes; record ns/op and allocs/op. `Get` with 50K live entries should be O(queues) for the copy (one queue here) plus the no-op `expireUpTo` peek - sub-microsecond aside from the map copy. Report is O(n log n) for 50K heap inserts. There is no hard pass/fail threshold; the artifact is the recorded numbers demonstrating the service is not a new bottleneck.
+Expected: completes; record ns/op and allocs/op. `Get` with 50K live entries should be O(queues) for the copy (one queue here) plus the no-op `expireUpTo` peek. Report is O(n log n) for 50K heap inserts. There is no hard pass/fail threshold; the artifact is the recorded numbers demonstrating the service is not a new bottleneck.
 
 - [ ] **Step 3: Commit**
 
@@ -1084,7 +1223,7 @@ git commit -m "test(scheduler): benchmark ShortJobPenaltyService at 50k short jo
 
 ---
 
-## Task 8: Full-suite verification
+## Task 9: Full-suite verification
 
 - [ ] **Step 1: Build everything**
 
@@ -1097,13 +1236,19 @@ Postgres must be running (see CLAUDE.md - `armada-dev deps` / `armada-dev init` 
 
 Run:
 ```bash
-TZ=UTC go test -count=1 ./internal/scheduler/scheduling/... ./internal/scheduler/
+TZ=UTC go test -count=1 ./internal/scheduler/scheduling/... ./internal/scheduler/ ./internal/scheduler/jobdb/
 ```
 Expected: PASS.
 
 - [ ] **Step 3: Run the local CI equivalent**
 
-Invoke the `armada-local-ci` skill (golangci-lint, go build, go mod tidy, focused tests on changed packages) to catch lint/format issues before pushing.
+Invoke the `armada-local-ci` skill if available in your environment. If it is not, run the equivalent directly:
+
+```bash
+go mod tidy
+golangci-lint run ./internal/scheduler/... --timeout 5m
+go build ./...
+```
 
 Expected: clean.
 
@@ -1116,14 +1261,17 @@ git commit -m "chore(scheduler): lint/format fixups for short-job penalty servic
 
 ---
 
-## Self-Review notes (verified during planning)
+## Self-Review notes (verified during planning + Revision 2 review)
 
 - **Spec coverage:**
   - "New service owns penalty state, wired into lifecycle path" -> Tasks 1, 2, 4.
-  - "FairSchedulingAlgo no longer iterates jobs to compute penalty; queries service" -> Task 3 (per-job branch removed, `GetPenaltiesForPool` added; terminal-job fetch dropped).
-  - "Terminal short jobs eligible for deletion on normal path" -> Task 4 (unconditional GC, `fullJobGc` removed).
+  - "FairSchedulingAlgo no longer iterates jobs to compute penalty; queries service" -> Task 3 (per-job branch removed, `GetPenaltiesForPool` added; terminal-job fetch dropped; `SchedulingAlgo` interface + mock updated).
+  - "Terminal short jobs eligible for deletion on normal path" -> Task 4 (unconditional GC, `fullJobGc` removed) + Task 7 (dead index removed).
   - "Penalty entries expire correctly without jobdb retention (tests)" -> Task 2 (`TestService_EntryExpiresExactlyAtDeadline`, `TestService_PostExpiryReReportNeverReQualifies`).
-  - "Existing behavior preserved end-to-end" -> Task 1 ports every old qualification assertion; Task 3 asserts the service value reaches the queue context; `Cancelled` is in the tap set (parity for cancel-while-running).
-  - "No regression at 50K+ short jobs (benchmark)" -> Task 7.
-- **Type consistency:** `ShortJobPenaltyService`, `NewShortJobPenaltyService`, `ReportFinishedJob(job, now)`, `GetPenaltiesForPool(pool, now)`, `shouldApplyPenalty(job, now)`, `penaltyEntry`, `entryHeap` used consistently across all tasks. The struct field name `shortJobPenalty` is retained on both `Scheduler` and `FairSchedulingAlgo`; only its type changes.
-- **`ResourceList.AllZero()` confirmed** (resource_list.go:108) - the prune check in `subtractFromSums`. `IsEmpty()` is explicitly NOT the right check for a summed value (it only tests `factory == nil`).
+  - "Existing behavior preserved end-to-end" -> Task 1 ports every old qualification assertion (incl. zero-`now`); Task 3 asserts the service value reaches the queue context; Task 4's two-phase tests pin the real run-row/job-row lifecycle on both leader and follower, including the dedup-on-replay property and the single accepted deviation (charge start moves one round-trip later; expiry unchanged).
+  - "No regression at 50K+ short jobs (benchmark)" -> Task 8.
+- **Correctness invariants the tests pin:** (1) the feed must key off job-level `InTerminalState`, never the run-level jst flags (two-phase test fails otherwise); (2) feed-before-GC in one function with no intervening error return (failure-mode points 2-3); (3) dedup by job id makes cursor replays no-ops; (4) expiry-deadline/gate equivalence makes post-expiry re-reports impossible without tombstones; (5) followers accumulate identical state, so failover loses nothing.
+- **Type consistency:** `ShortJobPenaltyService`, `NewShortJobPenaltyService`, `ReportFinishedJob(job, now)`, `GetPenaltiesForPool(pool, now)`, `shouldApplyPenalty(job, now)`, `penaltyEntry`, `entryHeap`, `ptrTime` used consistently across all tasks. The struct field name `shortJobPenalty` is retained on both `Scheduler` and `FairSchedulingAlgo`; only its type changes.
+- **`ResourceList` methods confirmed:** `Equal` (resource_list.go:17), `AllZero` (:108), `IsEmpty` (:145 - explicitly NOT the prune check), `Add` (:221), `Subtract` (:236).
+- **Compile-site inventory for the `Schedule` signature change:** interface (scheduling_algo.go:38-41), `FairSchedulingAlgo.Schedule` (:109), mock `testSchedulingAlgo.Schedule` (scheduler_test.go:2150), callers at scheduler.go:362 and scheduling_algo_test.go:73/:216/:980. The `scheduler.Schedule(ctx)` at scheduling_algo.go:864 is a different type and is untouched.
+- **Compile-site inventory for the `syncState` signature change:** definition (scheduler.go:426), callers at scheduler.go:273, scheduler.go:1263, scheduler_test.go:1779, scheduler_test.go:2002.
