@@ -4,7 +4,12 @@
 
 **Goal:** Extract short-job-penalty accounting into a dedicated in-memory service driven by job-lifecycle events, so the scheduler stops scanning every job in jobdb each cycle to recompute the penalty and jobdb can immediately GC terminal short jobs.
 
-**Architecture:** A new `ShortJobPenaltyService` owns penalty state keyed by `(pool, queue) -> ResourceList`. Terminal short jobs are reported into it once, **on every node (leader and followers)**, from inside `syncState` immediately after `ReconcileDifferences` derives the cycle's `jsts` and **before** the (now unconditional) terminal-job GC in the same function. The candidate check at the call site is `jst.Job.InTerminalState()` — the job-level terminal state — NOT the run-level `jst.Succeeded/Failed/Cancelled` transition flags (see "Lifecycle timing facts" below for why the flags are wrong). State self-expires lazily via a deadline min-heap evaluated against a pinned cycle-start `now` that is threaded as an explicit parameter into the write path (`cycle` -> `syncState` -> `ReportFinishedJob`) and the read path (`Schedule` -> `calculateJobSchedulingInfo` -> `GetPenaltiesForPool`). The old per-job `ShouldApplyPenalty` predicate is reused verbatim as the service's internal qualification gate (it is load-bearing for both today-parity and post-expiry dedup). jobdb GC becomes unconditional, the `fullJobGc` special case and the `GetAllTerminalJobs` fetch in the scheduling round are removed, and the now-dead `terminalJobs` jobdb index is deleted.
+**Architecture:** A new `ShortJobPenaltyService` owns penalty state keyed by `(pool, queue) -> ResourceList`. Jobs are reported into it (idempotently, dedup by job id) from **two feed points** whose roles are complementary:
+
+1. **Same-cycle leader feed** (today-parity charge timing): in `cycle()`, after `generateUpdateMessages` and `expireJobsIfNecessary` have set job-level terminal flags and upserted the affected jobs into the txn, and **before** `schedulingAlgo.Schedule` — i.e. at exactly the point where today's per-job scan would observe those flags. It iterates `updatedJobs` and reports the **live** txn job (`txn.GetById`), so the `Schedule` call in the same cycle sees identical penalties to today's scan.
+2. **syncState feed** (durability + failover state): on **every node (leader and followers)**, inside `syncState` immediately after `ReconcileDifferences` derives the cycle's `jsts` and **before** the (now unconditional) terminal-job GC in the same function. On the leader this is normally a dedup no-op (the job was charged by feed 1 a round-trip earlier); on followers it builds the state that makes failover lossless; and it guarantees no job is ever GC'd from jobdb without having been offered to the service on that node first.
+
+The candidate check at both call sites is the job-level `InTerminalState()` — NOT the run-level `jst.Succeeded/Failed/Cancelled` transition flags (see "Lifecycle timing facts" below for why the flags are wrong). State self-expires lazily via a deadline min-heap evaluated against a pinned cycle-start `now` that is threaded as an explicit parameter into the write path (`cycle` -> feeds -> `ReportFinishedJob`) and the read path (`Schedule` -> `calculateJobSchedulingInfo` -> `GetPenaltiesForPool`). The old per-job `ShouldApplyPenalty` predicate is reused verbatim as the service's internal qualification gate (it is load-bearing for both today-parity and post-expiry dedup). jobdb GC becomes unconditional, the `fullJobGc` special case and the `GetAllTerminalJobs` fetch in the scheduling round are removed, and the now-dead `terminalJobs` jobdb index is deleted.
 
 **Tech Stack:** Go, `container/heap` (stdlib), existing `internaltypes.ResourceList` value type, testify.
 
@@ -22,9 +27,17 @@ Revision 1 was reviewed against the codebase at `9c8126f`. The following defects
 6. **Dead code v1 left behind (fixed):** after the `GetAllTerminalJobs` fetch is removed, the jobdb `terminalJobs` index is maintained on every upsert/delete for zero readers. Task 7 deletes the method, the index, and its tests.
 7. **Benchmark compile errors (fixed):** missing `jobdb` import; `ptr` vs `ptrTime` helper inconsistency (now `ptrTime` everywhere, defined once in the service test file).
 8. **`penaltyEntry.heapIndex` removed:** it was written by the heap but never read (no `heap.Fix`/`heap.Remove` use; entries are immutable and removed only via `Pop`).
-9. **Accepted, documented behavior deviation — charge start timing:** see "Lifecycle timing facts" point D. This is the only intentional deviation from today's behavior and it is bounded to one Pulsar round-trip.
+9. ~~Accepted, documented behavior deviation — charge start timing.~~ **Superseded by Revision 3.**
 
 Design-decision bullets below have been rewritten where their v1 premises were factually wrong; the changes were made at the plan owner's request ("update the plan according to your findings").
+
+## Revision 3 changelog
+
+The Revision 2 design charged the penalty one Pulsar round-trip later than today (at cycle N+k, when the job-level terminal flag returns from the database, instead of cycle N, when the run-terminal row arrives). The plan owner rejected that deviation: **charge timing must be identical to today.**
+
+Fix: add a **same-cycle leader feed** in `cycle()` at the exact point where today's behavior is produced — after `generateUpdateMessages`/`expireJobsIfNecessary` have set job-level terminal flags and upserted the jobs, before `Schedule` runs. Today's per-job scan inside `Schedule` reads those freshly-upserted flags; the new feed reports the same live txn jobs to the service immediately before `Schedule`, so `GetPenaltiesForPool` returns exactly what today's scan would have computed, in the same cycle, against the same pinned `now`. The all-nodes `syncState` feed from Revision 2 is **kept** (it provides follower/failover state and the GC-safety guarantee); dedup by job id makes the two feeds reporting the same job harmless.
+
+A consequence worth noting: the same-cycle feed iterates `updatedJobs`, which on the `updateAll` failover path is `txn.GetAll()`. In v1 this was treated as a hazard ("would re-charge every job"); with the dedup + gate inside `ReportFinishedJob` it is not only safe but **required** for failover parity — a freshly promoted leader processes all jobs through `generateUpdateMessages` on that cycle and the full pass charges, in that same cycle, any short job that went terminal around the failover, exactly as today's scan of the retained jobdb would have. The two-phase tests and a dedicated failover test in Task 4 pin all of this.
 
 ---
 
@@ -35,19 +48,21 @@ These were verified at `9c8126f` and are the reason the feed looks the way it do
 - **(A) Run-level and job-level terminal flags arrive in different cycles.** When a run succeeds, the executor-side event updates only the **runs** table. In that cycle (call it N), `reconcileRunDifferences` sets `rst.Succeeded` -> `jst.Succeeded = true` (`jobdb/reconciliation.go:272-274`), but reconciliation never propagates run state to the job-level flag, so `jst.Job.InTerminalState()` is still false during `syncState`. The job-level flag is set later **in the same cycle, after syncState**, by `generateUpdateMessagesFromJob` (`scheduler.go:957` for success, `:1010` for failure), which upserts the modified job into the cycle txn (`scheduler.go:1057-1060`) and publishes `JobSucceeded`/`JobErrors`.
 - **(B) The round-trip job-row update carries no run rows.** `JobSucceeded` maps to `MarkJobsSucceeded` and terminal `JobErrors` to `MarkJobsFailed` — **jobs-table-only** writes (`scheduleringester/instructions.go:300-312`). So at the cycle where the job row lands back (call it N+k), the fetch window contains the job row but no run row: every run-level jst flag is false. A jst is still generated for the job (every job id in the fetch window gets one — `jobdb/reconciliation.go:92, 114-116`), and `jst.Job` is the current jobdb job, which IS job-level terminal (on the leader it was upserted terminal in cycle N; on followers the job-row reconcile at N+k sets it via `reconciliation.go:185-186`).
 - **(C) Consequence:** `jst.Succeeded || jst.Failed || jst.Cancelled` and `jst.Job.InTerminalState()` are **disjoint in time** for the success/failure paths. Only `jst.Job.InTerminalState()` identifies the cycle where the gate can pass. (Cancellation and lease-expiry happen to set both at N+k because their round-trips also touch the run row and `enforceTerminalStateExclusivity` re-raises the rst flag on any run-row touch — `reconciliation.go:284, 291-302` — but the feed must not rely on that.)
-- **(D) Accepted deviation — charge start timing.** Today the penalty starts in cycle N: the per-job scan runs during `Schedule`, after `generateUpdateMessagesFromJob` has upserted the job-level flag. The service charges at cycle N+k, when the job-level terminal flag round-trips through Pulsar/ingester into the jobs table (typically one or two cycles, i.e. seconds). The expiry deadline (`runStart + cutoff`) is unchanged, so the charged window shrinks by the round-trip latency — a small, bounded under-penalization relative to cutoffs measured in minutes. This is the only intended behavior change and Task 4's two-phase test pins it down explicitly.
-- **(E) GC timing under the new design.** In cycle N the jst's job is not yet job-level terminal, so the (unconditional) GC does not delete it — `generateUpdateMessagesFromJob` still finds it. At N+k the jst's job is terminal: the feed charges it and the GC deletes it, in that order, inside the same `syncState` call with no error return between. jobdb retention for terminal jobs drops from "cutoff + up to 10 cycles" to "one Pulsar round-trip".
+- **(D) How same-cycle charge parity is preserved (Revision 3).** Today the penalty starts in cycle N: the per-job scan runs during `Schedule`, after `generateUpdateMessagesFromJob` has set the job-level flag and upserted the job (`scheduler.go:957, :1010, :1057-1060`), and after `expireJobsIfNecessary` has failed lease-expired jobs the same way (`scheduler.go:1116`). The same-cycle leader feed is inserted at precisely that point — after both of those, before the `Schedule` call at :353-362 — and reports the **live** txn job (`txn.GetById(job.Id())`, because the `updatedJobs` slice holds pre-update snapshots). The gate evaluates the same pinned cycle-start `now` that `SetNow(start)` provides today. Result: `GetPenaltiesForPool` inside `Schedule` returns, in cycle N, exactly the set and values today's scan computes in cycle N. The syncState feed at N+k is then a dedup no-op on the leader.
+- **(E) GC timing under the new design.** In cycle N the jst's job is not yet job-level terminal at syncState time, so the (unconditional) GC does not delete it — `generateUpdateMessagesFromJob` still finds it, and the same-cycle feed charges it. At N+k the jst's job is terminal: the syncState feed re-offers it (dedup no-op on the leader; the real charge on followers) and the GC deletes it, in that order, inside the same `syncState` call with no error return between. jobdb retention for terminal jobs drops from "cutoff + up to 10 cycles" to "one Pulsar round-trip".
 
 ### Failure-mode walk-through (why there are no lost or double charges)
 
 The service is in-memory and the jobdb txn is transactional; the DB cursors (`jobsSerial`/`runsSerial`) only advance after a successful publish on the leader (`scheduler.go:391-392`) or at the non-leader early-out (`scheduler.go:287-288`). Walking every failure point:
 
-1. **Error in `syncState` before the feed** (fetch, reconcile, upsert): txn aborted, cursors not advanced, nothing charged. Next cycle re-fetches the same rows and retries from scratch.
-2. **Error in `syncState` after the feed, before commit** (`BatchDelete`): service charged, txn aborted, cursors not advanced. Next cycle re-derives the same jsts; `ReportFinishedJob` dedups by job id (`byId`), so the re-report is a no-op. No double charge, no loss.
-3. **Error anywhere after `syncState` committed** (leader block: run-error fetch, submit check, scheduling, publish): the charge already happened inside `syncState`. Cursors not advanced -> the job row is re-fetched next cycle; even though the job was GC'd and its run rows' serials are already consumed (so the row-recreated job has no runs and would fail the gate — `reconciliation.go:162-166`), the `byId` dedup short-circuits first. No loss (already charged), no double charge.
-4. **Leader failover:** followers run the same `syncState` feed against the same DB stream, so the new leader's service already holds the penalties. No failover gap (matches today, where followers retain terminal short jobs in jobdb via the GC skip).
-5. **Cold restart:** in-memory state is lost and `FetchInitialJobs` filters terminated jobs, so jobs already job-level terminal in the DB are never re-fetched -> not penalized for up to one cutoff window. **This matches today exactly** (a restarted scheduler's jobdb also has no terminal jobs for the same reason); it is not a new gap.
-6. **Publish-failure replay:** cursors not advanced -> same rows re-fetched -> same jsts -> `byId` dedup. Post-expiry replay can never re-charge because the expiry deadline (`runStart + cutoff`) and the gate (`now - runStart < cutoff`) are the same inequality over the same immutable `runStart` — an expired entry can never re-qualify, so no tombstones are needed.
+1. **Error in `syncState` before its feed** (fetch, reconcile, upsert): txn aborted, cursors not advanced, nothing charged. Next cycle re-fetches the same rows and retries from scratch.
+2. **Error in `syncState` after its feed, before commit** (`BatchDelete`): service charged, txn aborted, cursors not advanced. Next cycle re-derives the same jsts; `ReportFinishedJob` dedups by job id (`byId`), so the re-report is a no-op. No double charge, no loss.
+3. **Error in the leader block before the same-cycle feed** (run-error fetch at :316, `generateUpdateMessages`, `submitCheck`, `expireJobsIfNecessary`): the cycle txn is aborted (job-level flags revert), cursors not advanced, nothing extra charged. Next cycle re-fetches the same run rows, re-derives the transitions, and the same-cycle feed charges on the retry — the same recovery today's scan gets (it would also not have run, because `Schedule` is after all those error returns).
+4. **Error after the same-cycle feed, before commit/publish** (scheduling, publish): service charged; the cycle txn may abort (job-level flags revert in jobdb) but cursors are also not advanced, so the transitions are re-derived next cycle and dedup makes the re-report a no-op. Today's equivalent: the scan recomputes from re-derived jobdb state next cycle — same observable penalties from the next successful `Schedule` onward.
+5. **Error anywhere after `syncState` committed at N+k:** the charge happened at N (same-cycle feed) or at this `syncState` (its feed, before GC). Cursors not advanced -> the job row is re-fetched next cycle; even though the job was GC'd and its run rows' serials are already consumed (so the row-recreated job has no runs and would fail the gate — `reconciliation.go:162-166`), the `byId` dedup short-circuits first. No loss, no double charge.
+6. **Leader failover:** two complementary mechanisms. (a) Followers run the same `syncState` feed against the same DB stream, so the new leader's service already holds every penalty whose job row round-tripped before the failover. (b) For jobs that went terminal *around* the failover (run row arrived, `JobSucceeded` not yet round-tripped), the new leader's first cycle runs with `updateAll` -> `updatedJobs = txn.GetAll()` -> `generateUpdateMessages` sets their job-level flags -> the same-cycle feed charges them **in that same cycle**, exactly as today's scan of the retained jobdb would. No failover gap, no timing regression.
+7. **Cold restart:** in-memory state is lost and `FetchInitialJobs` filters terminated jobs, so jobs already job-level terminal in the DB are never re-fetched -> not penalized for up to one cutoff window. **This matches today exactly** (a restarted scheduler's jobdb also has no terminal jobs for the same reason); it is not a new gap.
+8. **Publish-failure replay:** cursors not advanced -> same rows re-fetched -> same jsts/updatedJobs -> `byId` dedup at both feeds. Post-expiry replay can never re-charge because the expiry deadline (`runStart + cutoff`) and the gate (`now - runStart < cutoff`) are the same inequality over the same immutable `runStart` — an expired entry can never re-qualify, so no tombstones are needed.
 
 ---
 
@@ -56,11 +71,12 @@ The service is in-memory and the jobdb txn is transactional; the DB cursors (`jo
 - **No `ReportDeletedJob`.** Finish/terminal event + lazy time-based expiry fully reproduces today's behavior. Deletion events are not added (they reintroduce double-count/ordering hazards for no benefit). *(Unchanged from v1.)*
 - **Terminal candidate check = `jst.Job.InTerminalState()`** (job-level `Succeeded || Failed || Cancelled`), evaluated at the feed call site. **Never use the jst run-level transition flags** (`jst.Succeeded` etc.) — they are false on the only cycle where the job qualifies (Lifecycle facts A-C). Cancel-while-running short jobs ARE penalized today; the job-level check preserves that (the job-level cancelled flag round-trips like the others).
 - **The candidate check is only a cheap pre-filter.** The real gate is `shouldApplyPenalty(job, now)`, ported verbatim from `ShortJobPenalty.ShouldApplyPenalty`. It does double duty: today-parity filter AND post-expiry dedup (failure-mode point 6).
-- **One pinned cycle-start `now`,** threaded as an explicit parameter: `Run`'s per-tick `start` -> `cycle(..., now)` -> `syncState(..., now)` (write path) and `Schedule(ctx, txn, now)` (read path). No `SetNow` setter. No `time.Now()` at call sites. `initialise` passes `s.clock.Now()` to its `syncState` call (harmless: initial jobs are non-terminal, the gate rejects everything).
-- **Feed runs in `syncState`, every cycle, on every node** (leader and followers), after `ReconcileDifferences`/upsert and before GC. Rationale: failover parity, feed/GC atomicity, structural immunity to the `updateAll` `txn.GetAll()` hazard (Revision 2 changelog, point 2). The feed never touches `updatedJobs`.
+- **One pinned cycle-start `now`,** threaded as an explicit parameter: `Run`'s per-tick `start` -> `cycle(..., now)` -> both feeds and `syncState(..., now)` (write path) and `Schedule(ctx, txn, now)` (read path). No `SetNow` setter. No `time.Now()` at call sites. `initialise` passes `s.clock.Now()` to its `syncState` call (harmless: initial jobs are non-terminal, the gate rejects everything).
+- **Two feed points, both idempotent (dedup by job id):** (1) the same-cycle leader feed in `cycle()` after `generateUpdateMessages`/`expireJobsIfNecessary`, before `Schedule`, iterating `updatedJobs` and reporting the live `txn.GetById` job — this is what makes charge timing identical to today; (2) the `syncState` feed, every cycle, on every node, after `ReconcileDifferences`/upsert and before GC, iterating `jsts` — this is what makes failover lossless and guarantees nothing is GC'd unreported. Neither feed consults the run-level jst flags.
+- **Iterating `updatedJobs` (= `txn.GetAll()` on the `updateAll` failover path) in the same-cycle feed is deliberate.** v1 treated this as a re-charge hazard; with the gate + dedup inside `ReportFinishedJob` it is a no-op for already-counted jobs and is exactly what gives a freshly promoted leader same-cycle charge parity for jobs that went terminal around the failover (failure-mode point 6b).
 - **GC becomes unconditional in `syncState`.** It no longer consults the penalty. The `fullJobGc` parameter and the `cycleNumber%10==0` full-sweep exist solely to eventually collect short jobs the per-cycle GC skipped; both are removed. The `terminalJobs` jobdb index then has zero readers and is removed too (Task 7).
-- **Cold-restart gap accepted; failover gap eliminated.** See failure-mode points 4-5. The cold-restart behavior is identical to today's; no restart-rebuild DB query.
-- **Charge start moves from cycle N to cycle N+k** (one Pulsar round-trip later); expiry deadline unchanged. Accepted and pinned by test (Lifecycle fact D).
+- **Cold-restart gap accepted; failover gap eliminated.** See failure-mode points 6-7. The cold-restart behavior is identical to today's; no restart-rebuild DB query.
+- **Charge timing is identical to today** (Revision 3): the penalty becomes visible to `Schedule` in the same cycle the run-terminal row arrives, against the same pinned `now`, with the same expiry deadline. Pinned by Task 4's tests.
 - **Cutoff is keyed per-pool** (`cutoffs[pool]`). Config is restart-only; no hot reload. An unconfigured pool yields cutoff `0`, so `now - runStart < 0` is always false -> never penalized (matches today, short_job_penalty.go:52).
 - **No mutex.** Verified single-goroutine access: zero goroutines in `scheduling_algo.go`, `queue_scheduler.go`, `preempting_queue_scheduler.go`, `scheduler.go`. The cycle loop is the only writer/reader; Prometheus reads the copied `queueContext.ShortJobPenalty` snapshot (`metrics/cycle_metrics.go:573, :828`), never the live service. Do not add a lock for future-proofing.
 - **Known harmless parity nuance:** the old per-job scan skipped jobs whose queue no longer exists (`scheduling_algo.go:590-594`); the service will briefly hold sums for such queues. Downstream consumption is keyed by existing queues (`AddQueueSchedulingContext`), so the extra entries are never read, and they expire within one cutoff window. Do not add queue-existence filtering to the service.
@@ -78,7 +94,7 @@ The service is in-memory and the jobdb txn is transactional; the DB cursors (`jo
 - `internal/scheduler/scheduling/short_job_penalty.go` - DELETE this file (the old `ShortJobPenalty` type, `NewShortJobPenalty`, `SetNow`, `ShouldApplyPenalty`). Its logic moves into the service file.
 - `internal/scheduler/scheduling/short_job_penalty_test.go` - DELETE (every assertion ported into the service test, including the zero-`now` case).
 - `internal/scheduler/scheduling/scheduling_algo.go` - **`SchedulingAlgo` interface gains `now time.Time` (:38-41)**; struct field type change (:62); constructor param type (:74); thread `now` through `Schedule` (:109) -> `runPoolSchedulingRound` (:203) -> `newFairSchedulingAlgoContext` (:411) -> `calculateJobSchedulingInfo` (:579); replace the per-job penalty branch (:596-602) with a `GetPenaltiesForPool` call; drop `GetAllTerminalJobs` from the scheduling round (:441, :445) and its comment bullet (:436-437).
-- `internal/scheduler/scheduler.go` - thread `now` into `cycle` (:266) and `syncState` (:426); move the penalty feed into `syncState` (all nodes, before GC); remove `SetNow` calls (:153, :172); make `syncState` GC unconditional and drop the `fullJobGc` param + full-sweep; update call sites (:211, :273, :362, :1263); `Scheduler` struct field (:71) and `NewScheduler` param (:109) type change.
+- `internal/scheduler/scheduler.go` - thread `now` into `cycle` (:266) and `syncState` (:426); add the syncState feed (all nodes, before GC) and the same-cycle leader feed (after `expireJobsIfNecessary` :344-349, before the `Schedule` block :351-362); remove `SetNow` calls (:153, :172); make `syncState` GC unconditional and drop the `fullJobGc` param + full-sweep; update call sites (:211, :273, :362, :1263); `Scheduler` struct field (:71) and `NewScheduler` param (:109) type change.
 - `internal/scheduler/schedulerapp.go` - construct `NewShortJobPenaltyService` instead of `NewShortJobPenalty` (:350).
 - `internal/scheduler/scheduling/scheduling_algo_test.go` - update the three `Schedule(ctx, txn)` calls (:73, :216, :980) and, where penalty behavior is exercised, the three `NewFairSchedulingAlgo` calls (:55, :196, :922).
 - `internal/scheduler/scheduler_test.go` - update `testSchedulingAlgo.Schedule` (:2150), the `cycle(...)` calls (:1058, :1225, :1232, :1297, :3328), the direct `syncState(...)` calls (:1779, :2002); add the two-phase lifecycle test.
@@ -469,11 +485,13 @@ Expected: FAIL - `ReportFinishedJob` and `GetPenaltiesForPool` undefined.
 Append to `internal/scheduler/scheduling/short_job_penalty_service.go`:
 
 ```go
-// ReportFinishedJob is called from syncState on every node, for each
-// job-state-transition whose job is in a job-level terminal state
-// (job.InTerminalState()). shouldApplyPenalty is the authoritative gate;
-// callers may pre-filter on job.InTerminalState() as an optimization but must
-// NOT pre-filter on the jst run-level transition flags (see plan: "Lifecycle
+// ReportFinishedJob is idempotent and is called from two feed points: the
+// same-cycle leader feed in cycle() (live txn jobs, after generateUpdateMessages
+// sets job-level terminal flags - this gives today-parity charge timing) and
+// the syncState feed on every node (jst jobs, before GC - this gives failover
+// durability). shouldApplyPenalty is the authoritative gate; callers may
+// pre-filter on job.InTerminalState() as an optimization but must NOT
+// pre-filter on the jst run-level transition flags (see plan: "Lifecycle
 // timing facts"). now must be the pinned cycle-start time. Re-reports of an
 // already-counted job are no-ops (dedup by job id); reports after the entry
 // expired can never re-qualify (the gate and the expiry deadline are the same
@@ -828,20 +846,21 @@ git commit -m "feat(scheduler): read short-job penalty from service; drop termin
 
 ---
 
-## Task 4: Feed the service from syncState (all nodes), thread `now` into cycle/syncState, make GC unconditional
+## Task 4: Add both feeds, thread `now` into cycle/syncState, make GC unconditional
 
 **Files:**
 - Modify: `internal/scheduler/scheduler.go`
   - `cycle` (:266) gains a `now time.Time` parameter; pass it to `syncState` (:273) and `schedulingAlgo.Schedule` (:362)
-  - `syncState` (:426): drop the `fullJobGc` param, gain `now time.Time`; add the penalty feed after the upsert block and before GC; GC unconditionally; remove the `ShouldApplyPenalty` skip
+  - add the **same-cycle leader feed** in `cycle()` after `expireJobsIfNecessary` (:344-349) and before the `Schedule` block (:351-353)
+  - `syncState` (:426): drop the `fullJobGc` param, gain `now time.Time`; add the **syncState feed** after the upsert block and before GC; GC unconditionally; remove the `ShouldApplyPenalty` skip
   - remove `SetNow` calls (:153, :172)
   - `Run` passes its pinned `start` into `cycle` (:211)
   - the initialise-path `syncState` call (:1263) passes `s.clock.Now()`
-- Modify: `internal/scheduler/scheduler_test.go` - update `cycle(...)` calls (:1058, :1225, :1232, :1297, :3328) and the direct `syncState(...)` calls (:1779, :2002); add the two-phase lifecycle test
+- Modify: `internal/scheduler/scheduler_test.go` - update `cycle(...)` calls (:1058, :1225, :1232, :1297, :3328) and the direct `syncState(...)` calls (:1779, :2002); add the lifecycle tests
 
-- [ ] **Step 1: Write the failing test (two-phase terminal flow: run row first, job row later)**
+- [ ] **Step 1: Write the failing tests (two-phase terminal flow, follower feed, failover updateAll)**
 
-**This test exists to catch exactly the bug that killed Revision 1** (Lifecycle facts A-C). It MUST deliver the run-terminal row and the job-terminal row in *different* cycles - do not seed both in one fetch window, or the test will pass against broken feed designs.
+**The two-phase test exists to catch exactly the bug that killed Revision 1** (Lifecycle facts A-C). It MUST deliver the run-terminal row and the job-terminal row in *different* cycles - do not seed both in one fetch window, or the test will pass against broken feed designs.
 
 Add to `internal/scheduler/scheduler_test.go`, modeled on the existing cycle harness (see :1000-1065 for construction; `testJobRepository` at :2064 returns its `updatedJobs`/`updatedRuns` fields verbatim on each fetch, so mutate those fields between cycles; the multi-cycle pattern at :1225-1232 shows two sequential `cycle` calls):
 
@@ -855,10 +874,10 @@ func TestCycle_ShortJobPenalty_TwoPhaseTerminalFlow(t *testing.T) {
 	//
 	// Phase A - cycle 1: deliver ONLY the run row with Succeeded=true (bump its
 	// Serial); leave the job row untouched. Run sched.cycle(..., now1). Assert:
-	//   - the penalty service has NOT charged the job yet:
-	//     sched.shortJobPenalty.GetPenaltiesForPool(pool, now1) is empty
-	//     (run-level terminal arrived, job-level flag had not at syncState time;
-	//     this pins the accepted one-round-trip charge delay - Lifecycle fact D)
+	//   - the penalty IS charged in THIS cycle (same-cycle leader feed; this is
+	//     the today-parity property the plan owner requires - Lifecycle fact D):
+	//     sched.shortJobPenalty.GetPenaltiesForPool(pool, now1)[queue] equals
+	//     the job's AllResourceRequirements()
 	//   - the job is still in jobdb (not GC'd) and is now job-level terminal
 	//     (set by generateUpdateMessagesFromJob): txn.GetById(jobId) != nil and
 	//     .InTerminalState() == true
@@ -866,26 +885,43 @@ func TestCycle_ShortJobPenalty_TwoPhaseTerminalFlow(t *testing.T) {
 	//
 	// Phase B - cycle 2: deliver ONLY the job row with Succeeded=true (bump its
 	// Serial); set updatedRuns to nil. Run sched.cycle(..., now2). Assert:
-	//   - the penalty IS charged:
-	//     sched.shortJobPenalty.GetPenaltiesForPool(pool, now2)[queue] equals
-	//     the job's AllResourceRequirements()
+	//   - the penalty total is UNCHANGED (the syncState feed's re-offer is a
+	//     dedup no-op on the leader)
 	//   - the job has been deleted from jobdb by the unconditional GC:
 	//     txn.GetById(jobId) == nil
 	//
 	// Phase C - re-deliver the same job row a third cycle (publish-failure
-	// replay simulation). Assert the penalty total is unchanged (dedup).
+	// replay simulation). Assert the penalty total is still unchanged (dedup).
 }
 
-func TestCycle_ShortJobPenalty_FollowerFeedsToo(t *testing.T) {
+func TestCycle_ShortJobPenalty_FollowerFeedsViaSyncState(t *testing.T) {
 	// Same two-phase flow, but run the cycles with a non-leader token (see the
 	// failover-style tests around :3300 for obtaining one; cycle exits before
-	// the leader block, so generateUpdateMessages never runs). Assert after
-	// phase B:
-	//   - the penalty IS charged on this follower (the job-row reconcile sets
-	//     the job-level flag via reconciliation.go:185-186, so the syncState
-	//     feed sees it)
-	//   - the job is GC'd from the follower's jobdb.
-	// This pins the failover-parity property (failure-mode point 4).
+	// the leader block, so neither generateUpdateMessages nor the same-cycle
+	// feed runs). Assert:
+	//   - after phase A: NOT charged (job-level flag has not arrived; followers
+	//     have no same-cycle feed - their state only matters at failover, where
+	//     the updateAll test below provides same-cycle parity)
+	//   - after phase B: charged (the job-row reconcile sets the job-level flag
+	//     via reconciliation.go:185-186, so the syncState feed sees it), and
+	//     the job is GC'd from the follower's jobdb.
+	// This pins the failover-durability property (failure-mode point 6a).
+}
+
+func TestCycle_ShortJobPenalty_FailoverUpdateAllChargesSameCycle(t *testing.T) {
+	// Pins failure-mode point 6b: a freshly promoted leader charges, in its
+	// FIRST cycle, short jobs that went terminal around the failover - exactly
+	// as today's scan of the retained jobdb would.
+	// Seed jobdb the way a follower's would look mid-flow: job present, run
+	// succeeded (run-level), job-level flag NOT set, no rows pending in the
+	// repo. Run sched.cycle(ctx, true /* updateAll */, leaderToken, ...).
+	// Assert:
+	//   - the penalty IS charged in this same cycle (updatedJobs = txn.GetAll()
+	//     -> generateUpdateMessages sets the job-level flag -> same-cycle feed
+	//     reports the live job)
+	//   - a JobSucceeded event was published.
+	// Then run a second updateAll cycle and assert the total is unchanged
+	// (dedup makes the GetAll pass idempotent - the v1 "re-charge" hazard).
 }
 ```
 
@@ -929,7 +965,31 @@ At the scheduling call (:362), pass `now` (replacing the Task 3 stopgap if one w
 		result, err = s.schedulingAlgo.Schedule(ctx, txn, now)
 ```
 
-- [ ] **Step 3b: Add the feed + unconditional GC in syncState**
+- [ ] **Step 3b: Add the same-cycle leader feed in cycle()**
+
+Insert after the `expireJobsIfNecessary` block (:344-349, i.e. after `events = append(events, expirationEvents...)`) and before `schedulerResult := scheduling.SchedulerResult{}` (:351):
+
+```go
+	// Charge the short-job penalty for jobs that went terminal this cycle.
+	// generateUpdateMessages and expireJobsIfNecessary above have just set
+	// job-level terminal flags and upserted the affected jobs into txn; reporting
+	// them here, before the Schedule call below, means GetPenaltiesForPool sees
+	// exactly what the old per-job scan saw in the same cycle. We look up the
+	// live job in txn because the updatedJobs slice holds pre-update snapshots.
+	// On the updateAll failover path updatedJobs is txn.GetAll(); iterating it
+	// here is deliberate - ReportFinishedJob dedups by job id and applies the
+	// qualification gate, and the full pass gives a freshly promoted leader
+	// same-cycle parity for jobs that went terminal around the failover.
+	for _, job := range updatedJobs {
+		if live := txn.GetById(job.Id()); live != nil && live.InTerminalState() {
+			s.shortJobPenalty.ReportFinishedJob(live, now)
+		}
+	}
+```
+
+This placement is load-bearing: it must be after every code path that sets job-level terminal flags in the txn (`generateUpdateMessagesFromJob` for success/failure/cancel, `expireJobsIfNecessary` for lease expiry) and before `schedulingAlgo.Schedule`. Do not move it earlier "for tidiness" - that reintroduces the one-cycle charge delay the plan owner rejected.
+
+- [ ] **Step 3c: Add the feed + unconditional GC in syncState**
 
 `syncState` signature (:426), drop `fullJobGc`, add `now`:
 ```go
@@ -939,14 +999,16 @@ func (s *Scheduler) syncState(ctx *armadacontext.Context, initial bool, now time
 Immediately after the upsert block (:478-485, `txn.Upsert(jobDbJobs)`), insert the feed - **before** the GC block so feed-then-GC is atomic with no error return between them (failure-mode points 2-3):
 
 ```go
-	// Feed terminal jobs into the short-job-penalty service. This runs on every
-	// node (leader and followers) so the in-memory penalty state survives leader
-	// failover; ReportFinishedJob dedups by job id, so replays after a failed
-	// publish (cursors not advanced) are no-ops. The candidate check is the
+	// Offer terminal jobs to the short-job-penalty service before deleting them.
+	// This runs on every node (leader and followers) so the in-memory penalty
+	// state survives leader failover; on the leader it is normally a dedup no-op
+	// because the same-cycle feed in cycle() already charged the job when it went
+	// terminal. ReportFinishedJob dedups by job id, so replays after a failed
+	// publish (cursors not advanced) are no-ops too. The candidate check is the
 	// job-level InTerminalState - the same condition the GC below uses. Do NOT
 	// filter on jst.Succeeded/Failed/Cancelled: those are run-level transition
 	// flags and are false on the cycle where the job-level terminal flag arrives
-	// from the database, which is the only cycle where the job qualifies.
+	// from the database, which is the only cycle where the job qualifies here.
 	for _, jst := range jsts {
 		if jst.Job.InTerminalState() {
 			s.shortJobPenalty.ReportFinishedJob(jst.Job, now)
@@ -999,7 +1061,7 @@ with:
 	}
 ```
 
-- [ ] **Step 3c: Update remaining syncState call sites**
+- [ ] **Step 3d: Update remaining syncState call sites**
 
 At :1263 (the initialise path; initial jobs are non-terminal so the gate rejects everything - the `now` value is immaterial but must be non-zero for clarity):
 ```go
@@ -1010,7 +1072,7 @@ In `internal/scheduler/scheduler_test.go`, the direct calls:
 - :1779: `sched.syncState(ctx, true, sched.clock.Now())`
 - :2002: `sched.syncState(ctx, false, sched.clock.Now())`
 
-- [ ] **Step 3d: Update cycle test call sites**
+- [ ] **Step 3e: Update cycle test call sites**
 
 In `internal/scheduler/scheduler_test.go`, add the `now` argument to each `cycle(...)` call (:1058, :1225, :1232, :1297, :3328). Use the same clock the test's scheduler uses. Example for :1058:
 ```go
@@ -1027,7 +1089,7 @@ Expected: PASS.
 
 ```bash
 git add internal/scheduler/scheduler.go internal/scheduler/scheduler_test.go
-git commit -m "feat(scheduler): feed penalty service from syncState on all nodes; unconditional terminal-job GC"
+git commit -m "feat(scheduler): feed penalty service same-cycle on leader and via syncState on all nodes; unconditional terminal-job GC"
 ```
 
 ---
@@ -1268,9 +1330,9 @@ git commit -m "chore(scheduler): lint/format fixups for short-job penalty servic
   - "FairSchedulingAlgo no longer iterates jobs to compute penalty; queries service" -> Task 3 (per-job branch removed, `GetPenaltiesForPool` added; terminal-job fetch dropped; `SchedulingAlgo` interface + mock updated).
   - "Terminal short jobs eligible for deletion on normal path" -> Task 4 (unconditional GC, `fullJobGc` removed) + Task 7 (dead index removed).
   - "Penalty entries expire correctly without jobdb retention (tests)" -> Task 2 (`TestService_EntryExpiresExactlyAtDeadline`, `TestService_PostExpiryReReportNeverReQualifies`).
-  - "Existing behavior preserved end-to-end" -> Task 1 ports every old qualification assertion (incl. zero-`now`); Task 3 asserts the service value reaches the queue context; Task 4's two-phase tests pin the real run-row/job-row lifecycle on both leader and follower, including the dedup-on-replay property and the single accepted deviation (charge start moves one round-trip later; expiry unchanged).
+  - "Existing behavior preserved end-to-end" -> Task 1 ports every old qualification assertion (incl. zero-`now`); Task 3 asserts the service value reaches the queue context; Task 4's tests pin the real run-row/job-row lifecycle on both leader and follower, the dedup-on-replay property, and - per Revision 3 - **same-cycle charge timing identical to today**, including on the failover/updateAll path.
   - "No regression at 50K+ short jobs (benchmark)" -> Task 8.
-- **Correctness invariants the tests pin:** (1) the feed must key off job-level `InTerminalState`, never the run-level jst flags (two-phase test fails otherwise); (2) feed-before-GC in one function with no intervening error return (failure-mode points 2-3); (3) dedup by job id makes cursor replays no-ops; (4) expiry-deadline/gate equivalence makes post-expiry re-reports impossible without tombstones; (5) followers accumulate identical state, so failover loses nothing.
+- **Correctness invariants the tests pin:** (1) the feeds must key off job-level `InTerminalState`, never the run-level jst flags (two-phase test fails otherwise); (2) the same-cycle leader feed sits after `generateUpdateMessages`/`expireJobsIfNecessary` and before `Schedule`, reporting live `txn.GetById` jobs - that exact placement is what reproduces today's charge timing (phase A assertion fails otherwise); (3) syncState feed-before-GC in one function with no intervening error return (failure-mode points 2 and 5); (4) dedup by job id makes cursor replays and the double-feed no-ops; (5) expiry-deadline/gate equivalence makes post-expiry re-reports impossible without tombstones; (6) followers accumulate state via syncState and a promoted leader's first `updateAll` cycle charges in-cycle via the `GetAll` pass, so failover loses neither charges nor timing.
 - **Type consistency:** `ShortJobPenaltyService`, `NewShortJobPenaltyService`, `ReportFinishedJob(job, now)`, `GetPenaltiesForPool(pool, now)`, `shouldApplyPenalty(job, now)`, `penaltyEntry`, `entryHeap`, `ptrTime` used consistently across all tasks. The struct field name `shortJobPenalty` is retained on both `Scheduler` and `FairSchedulingAlgo`; only its type changes.
 - **`ResourceList` methods confirmed:** `Equal` (resource_list.go:17), `AllZero` (:108), `IsEmpty` (:145 - explicitly NOT the prune check), `Add` (:221), `Subtract` (:236).
 - **Compile-site inventory for the `Schedule` signature change:** interface (scheduling_algo.go:38-41), `FairSchedulingAlgo.Schedule` (:109), mock `testSchedulingAlgo.Schedule` (scheduler_test.go:2150), callers at scheduler.go:362 and scheduling_algo_test.go:73/:216/:980. The `scheduler.Schedule(ctx)` at scheduling_algo.go:864 is a different type and is untouched.
